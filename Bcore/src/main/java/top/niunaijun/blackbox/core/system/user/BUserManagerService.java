@@ -60,6 +60,26 @@ public class BUserManagerService extends IBUserManagerService.Stub implements IS
     }
 
     @Override
+    public boolean renameUser(int userId, String name) {
+        if (name == null) {
+            return false;
+        }
+        String normalizedName = name.trim();
+        if (normalizedName.isEmpty() || normalizedName.length() > 64) {
+            return false;
+        }
+        synchronized (mUserLock) {
+            BUserInfo user = mUsers.get(userId);
+            if (user == null) {
+                return false;
+            }
+            user.name = normalizedName;
+            saveUserInfoLocked();
+            return true;
+        }
+    }
+
+    @Override
     public List<BUserInfo> getUsers() {
         synchronized (mUsers) {
             ArrayList<BUserInfo> bUsers = new ArrayList<>();
@@ -87,7 +107,9 @@ public class BUserManagerService extends IBUserManagerService.Stub implements IS
                 mUsers.remove(userId);
                 saveUserInfoLocked();
                 FileUtils.deleteDir(BEnvironment.getUserDir(userId));
+                FileUtils.deleteDir(BEnvironment.getUserDeDir(userId));
                 FileUtils.deleteDir(BEnvironment.getExternalUserDir(userId));
+                FileUtils.deleteDir(BEnvironment.getInstanceMetadataDir(userId).getParentFile());
             }
         }
     }
@@ -96,6 +118,12 @@ public class BUserManagerService extends IBUserManagerService.Stub implements IS
         BUserInfo bUserInfo = new BUserInfo();
         bUserInfo.id = userId;
         bUserInfo.status = BUserStatus.ENABLE;
+        bUserInfo.name = "Instance " + userId;
+        bUserInfo.createTime = System.currentTimeMillis();
+        FileUtils.mkdirs(BEnvironment.getUserDir(userId));
+        FileUtils.mkdirs(BEnvironment.getUserDeDir(userId));
+        FileUtils.mkdirs(BEnvironment.getExternalUserDir(userId));
+        FileUtils.mkdirs(BEnvironment.getInstanceMetadataDir(userId));
         mUsers.put(userId, bUserInfo);
         synchronized (mUsers) {
             saveUserInfoLocked();
@@ -144,8 +172,24 @@ public class BUserManagerService extends IBUserManagerService.Stub implements IS
                     return;
                 synchronized (mUsers) {
                     mUsers.clear();
+                    boolean migrated = false;
                     for (BUserInfo loadUser : loadUsers) {
+                        if (loadUser.name == null || loadUser.name.trim().isEmpty()) {
+                            loadUser.name = "Instance " + loadUser.id;
+                            migrated = true;
+                        }
+                        if (loadUser.createTime <= 0L) {
+                            loadUser.createTime = System.currentTimeMillis();
+                            migrated = true;
+                        }
+                        FileUtils.mkdirs(BEnvironment.getUserDir(loadUser.id));
+                        FileUtils.mkdirs(BEnvironment.getUserDeDir(loadUser.id));
+                        FileUtils.mkdirs(BEnvironment.getExternalUserDir(loadUser.id));
+                        FileUtils.mkdirs(BEnvironment.getInstanceMetadataDir(loadUser.id));
                         mUsers.put(loadUser.id, loadUser);
+                    }
+                    if (migrated) {
+                        saveUserInfoLocked();
                     }
                 }
             } catch (Exception e) {

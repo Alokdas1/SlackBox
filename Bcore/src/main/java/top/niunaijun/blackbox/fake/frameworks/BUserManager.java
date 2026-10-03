@@ -81,6 +81,21 @@ public class BUserManager extends BlackManager<IBUserManagerService> {
         }
     }
 
+    public boolean renameUser(int userId, String name) {
+        try {
+            IBUserManagerService service = getService();
+            if (service != null) {
+                return service.renameUser(userId, name);
+            }
+            Slog.w(TAG, "UserManager service is null, cannot rename user");
+        } catch (RemoteException e) {
+            Slog.e(TAG, "RemoteException in renameUser", e);
+        } catch (Exception e) {
+            Slog.e(TAG, "Unexpected error in renameUser", e);
+        }
+        return false;
+    }
+
     public List<BUserInfo> getUsers() {
         try {
             IBUserManagerService service = getService();

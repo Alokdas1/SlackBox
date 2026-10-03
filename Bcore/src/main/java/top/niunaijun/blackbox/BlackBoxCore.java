@@ -1200,6 +1200,11 @@ public class BlackBoxCore extends ClientConfiguration {
         return BUserManager.get().createUser(userId);
     }
 
+    /** Renames a persisted virtual instance. Returns false for invalid names or unknown instances. */
+    public boolean renameUser(int userId, String name) {
+        return BUserManager.get().renameUser(userId, name);
+    }
+
     public void deleteUser(int userId) {
         BUserManager.get().deleteUser(userId);
     }

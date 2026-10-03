@@ -10,6 +10,7 @@ interface IBUserManagerService {
     BUserInfo getUserInfo(int userId);
     boolean exists(int userId);
     BUserInfo createUser(int userId);
+    boolean renameUser(int userId, String name);
     List<BUserInfo> getUsers();
     void deleteUser(int userId);
 }

@@ -6,8 +6,10 @@ alias(libs.plugins.android.application) apply false
 }
 
 ext {
-    compileSdkVersion = 35
-    targetSdkVersion = 28 
+    // Android 16 is API 36. Keep version checks in the compatibility layer;
+    // the host itself must target the current platform behaviour.
+    compileSdkVersion = 36
+    targetSdkVersion = 36
 
     minSdk = 21
     versionCode = 400

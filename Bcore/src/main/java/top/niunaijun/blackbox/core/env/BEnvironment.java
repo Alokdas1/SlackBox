@@ -79,6 +79,27 @@ public class BEnvironment {
         return new File(sVirtualRoot, String.format(Locale.CHINA, "data/user/%d", userId));
     }
 
+    /**
+     * Root for device-encrypted virtual data. This is separate from credential
+     * encrypted application data and must be removed with the instance.
+     */
+    public static File getUserDeDir(int userId) {
+        return new File(sVirtualRoot, String.format(Locale.CHINA, "data/user_de/%d", userId));
+    }
+
+    /**
+     * Instance-scoped metadata owned by SlackBox rather than an installed APK.
+     * Package data remains under data/user/<id>/<package> so existing IO hooks
+     * and package-manager paths stay stable.
+     */
+    public static File getInstanceMetadataDir(int userId) {
+        return new File(sVirtualRoot, String.format(Locale.CHINA, "instances/%d/metadata", userId));
+    }
+
+    public static File getInstanceConfigFile(int userId) {
+        return new File(getInstanceMetadataDir(userId), "instance.conf");
+    }
+
     public static File getExternalObbDir(String packageName, int userId) {
         return new File(getExternalUserDir(userId), String.format(Locale.CHINA, "Android/obb/%s", packageName));
     }
