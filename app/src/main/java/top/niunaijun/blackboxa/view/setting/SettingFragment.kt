@@ -1,6 +1,9 @@
 package top.niunaijun.blackboxa.view.setting
 
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Gravity
@@ -133,6 +136,18 @@ class SettingFragment : PreferenceFragmentCompat() {
             AlertDialog.Builder(requireContext())
                     .setTitle("Recent guest diagnostics")
                     .setView(scroll)
+                    .setNeutralButton("Copy") { _, _ ->
+                        val clipboard = requireContext()
+                                .getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        if (clipboard != null) {
+                            clipboard.setPrimaryClip(
+                                    ClipData.newPlainText("SlackBox guest diagnostics", recentEvents)
+                            )
+                            toast("Guest diagnostics copied")
+                        } else {
+                            toast("Clipboard unavailable")
+                        }
+                    }
                     .setPositiveButton(android.R.string.ok, null)
                     .show()
             true
