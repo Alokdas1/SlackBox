@@ -19,7 +19,7 @@ The host labels and build artifacts are named **SlackBox**. Internal Java packag
 
 The Gradle build targets Android 16 (API 36) and compiles against API 36. The primary supported ABI is `arm64-v8a`; `armeabi-v7a` remains packaged because the current proxy-process design can host compatible 32-bit guest APKs on devices that still provide a 32-bit runtime.
 
-Android's application sandbox limits what a userspace container can do. In particular, SlackBox cannot provide kernel-level isolation, run arbitrary privileged system services, or guarantee that every app works under hidden-API and background-execution restrictions. Apps that require Play Integrity, hardware attestation, anti-cheat checks, or virtualization detection are not supported targets; SlackBox does not bypass those controls.
+Android's application sandbox limits what a userspace container can do. In particular, SlackBox cannot provide kernel-level isolation, run arbitrary privileged system services, or guarantee that every app works under hidden-API and background-execution restrictions. Apps that require Play Integrity, hardware attestation, anti-cheat checks, or virtualization detection are not supported targets; SlackBox does not bypass those controls. SlackBox does not compile a system-property/device-fingerprint spoofing hook; exposed device properties remain platform supplied.
 
 Guest activities render through normal Android windows and surfaces in the host's proxy processes. Hardware-accelerated GLES/Vulkan rendering therefore uses the device GPU when the guest and host Android framework allow it. No software renderer or fake GPU path is provided.
 
