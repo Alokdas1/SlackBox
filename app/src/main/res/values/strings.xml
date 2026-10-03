@@ -24,6 +24,12 @@
     <string name="hide_root">Hide Root</string>
     <string name="hide_xposed">Hide Xposed</string>
     <string name="userRemark">User Remark</string>
+    <string name="instance_create">Create instance</string>
+    <string name="instance_delete">Delete current instance</string>
+    <string name="instance_required_title">Create an instance first</string>
+    <string name="instance_required_message">Use the menu to create a virtual instance before installing an APK.</string>
+    <string name="instance_delete_title">Delete %1$s?</string>
+    <string name="instance_delete_message">All virtual apps and data in this instance will be removed.</string>
     <string name="done">Done</string>
     <string name="cancel">Cancel</string>
     <string name="permission_setting">Setting</string>

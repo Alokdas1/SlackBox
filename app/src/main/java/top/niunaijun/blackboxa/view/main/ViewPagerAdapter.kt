@@ -9,19 +9,27 @@ import top.niunaijun.blackboxa.view.apps.AppsFragment
 
 class ViewPagerAdapter(appCompatActivity: AppCompatActivity) : FragmentStateAdapter(appCompatActivity) {
 
-    private var fragmentList = mutableListOf<AppsFragment>()
+    private var instanceIds = emptyList<Int>()
 
-    fun replaceData(list: MutableList<AppsFragment>){
-        this.fragmentList = list
+    fun replaceData(ids: List<Int>) {
+        instanceIds = ids.toList()
         notifyDataSetChanged()
     }
 
     override fun getItemCount(): Int {
-        return fragmentList.size
+        return instanceIds.size
     }
 
     override fun createFragment(position: Int): Fragment {
-        return fragmentList[position]
+        return AppsFragment.newInstance(instanceIds[position])
+    }
+
+    override fun getItemId(position: Int): Long {
+        return instanceIds[position].toLong()
+    }
+
+    override fun containsItem(itemId: Long): Boolean {
+        return instanceIds.any { it.toLong() == itemId }
     }
 
 }

@@ -23,6 +23,12 @@
     <string name="hide_root">隱藏Root</string>
     <string name="hide_xposed">隱藏Xposed</string>
     <string name="userRemark">用戶備註</string>
+    <string name="instance_create">建立執行個體</string>
+    <string name="instance_delete">刪除目前執行個體</string>
+    <string name="instance_required_title">請先建立執行個體</string>
+    <string name="instance_required_message">請從選單建立虛擬執行個體，再安裝 APK。</string>
+    <string name="instance_delete_title">刪除 %1$s？</string>
+    <string name="instance_delete_message">此執行個體中的虛擬應用程式和資料都會被刪除。</string>
     <string name="done">確定</string>
     <string name="cancel">取消</string>
     <string name="permission_setting">許可權設定</string>

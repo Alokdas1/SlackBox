@@ -590,7 +590,10 @@ public class BPackageManagerService extends IBPackageManagerService.Stub impleme
     @Override
     public void deleteUser(int userId) throws RemoteException {
         synchronized (mPackages) {
-            for (BPackageSettings ps : mPackages.values()) {
+            // Uninstalling the final per-user copy removes its package record from
+            // mPackages. Iterate a stable snapshot so deleting an instance with
+            // packages unique to it cannot invalidate the live map iterator.
+            for (BPackageSettings ps : new ArrayList<>(mPackages.values())) {
                 uninstallPackageAsUser(ps.pkg.packageName, userId);
             }
         }

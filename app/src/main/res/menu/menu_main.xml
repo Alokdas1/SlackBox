@@ -2,6 +2,15 @@
 <menu xmlns:android="http://schemas.android.com/apk/res/android"
         xmlns:app="http://schemas.android.com/apk/res-auto">
 
+    <item
+            android:id="@+id/instance_create"
+            android:title="@string/instance_create"
+            app:showAsAction="never" />
+
+    <item
+            android:id="@+id/instance_delete"
+            android:title="@string/instance_delete"
+            app:showAsAction="never" />
 
     <item
             android:id="@+id/main_setting"

@@ -32,7 +32,8 @@ class MainActivity : LoadingActivity() {
 
     private lateinit var mViewPagerAdapter: ViewPagerAdapter
 
-    private val fragmentList = mutableListOf<AppsFragment>()
+    private var instanceIds = emptyList<Int>()
+    private var instanceNames = emptyMap<Int, String>()
 
     private var currentUser = 0
 
@@ -248,23 +249,21 @@ class MainActivity : LoadingActivity() {
 
     private fun initToolbarSubTitle() {
         try {
-            updateUserRemark(0)
-            
+            refreshInstances()
             viewBinding.toolbarLayout.toolbar.getChildAt(1)?.setOnClickListener {
                 try {
+                    val currentName = instanceNames[currentUser] ?: "Instance $currentUser"
                     MaterialDialog(this).show {
                         title(res = R.string.userRemark)
                         input(
                                 hintRes = R.string.userRemark,
-                                prefill = viewBinding.toolbarLayout.toolbar.subtitle
+                                prefill = currentName
                         ) { _, input ->
-                            try {
-                                AppManager.mRemarkSharedPreferences.edit {
-                                    putString("Remark$currentUser", input.toString())
-                                    viewBinding.toolbarLayout.toolbar.subtitle = input
-                                }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error saving user remark: ${e.message}")
+                            val renamed = BlackBoxCore.get().renameUser(currentUser, input.toString())
+                            if (renamed) {
+                                refreshInstances()
+                            } else {
+                                Log.w(TAG, "Instance rename rejected: userId=$currentUser")
                             }
                         }
                         positiveButton(res = R.string.done)
@@ -281,14 +280,9 @@ class MainActivity : LoadingActivity() {
 
     private fun initViewPager() {
         try {
-            val userList = BlackBoxCore.get().users
-            userList.forEach { fragmentList.add(AppsFragment.newInstance(it.id)) }
-
-            currentUser = userList.firstOrNull()?.id ?: 0
-            fragmentList.add(AppsFragment.newInstance(userList.size))
-
+            refreshInstances()
             mViewPagerAdapter = ViewPagerAdapter(this)
-            mViewPagerAdapter.replaceData(fragmentList)
+            mViewPagerAdapter.replaceData(instanceIds)
             viewBinding.viewPager.adapter = mViewPagerAdapter
             viewBinding.dotsIndicator.setViewPager2(viewBinding.viewPager)
             viewBinding.viewPager.registerOnPageChangeCallback(
@@ -296,7 +290,8 @@ class MainActivity : LoadingActivity() {
                         override fun onPageSelected(position: Int) {
                             try {
                                 super.onPageSelected(position)
-                                currentUser = fragmentList[position].userID
+                                if (position !in instanceIds.indices) return
+                                currentUser = instanceIds[position]
                                 updateUserRemark(currentUser)
                                 showFloatButton(true)
                             } catch (e: Exception) {
@@ -314,7 +309,15 @@ class MainActivity : LoadingActivity() {
         try {
             viewBinding.fab.setOnClickListener {
                 try {
-                    val userId = viewBinding.viewPager.currentItem
+                    if (currentUser < 0) {
+                        MaterialDialog(this@MainActivity).show {
+                            title(res = R.string.instance_required_title)
+                            message(res = R.string.instance_required_message)
+                            positiveButton(res = R.string.done)
+                        }
+                        return@setOnClickListener
+                    }
+                    val userId = currentUser
                     val intent = Intent(this, ListActivity::class.java)
                     intent.putExtra("userID", userId)
                     apkPathResult.launch(intent)
@@ -343,32 +346,78 @@ class MainActivity : LoadingActivity() {
 
     fun scanUser() {
         try {
-            val userList = BlackBoxCore.get().users
-
-            if (fragmentList.size == userList.size) {
-                fragmentList.add(AppsFragment.newInstance(fragmentList.size))
-            } else if (fragmentList.size > userList.size + 1) {
-                fragmentList.removeLast()
+            runOnUiThread {
+                val selectedUser = currentUser
+                refreshInstances()
+                mViewPagerAdapter.replaceData(instanceIds)
+                val selectedPosition = instanceIds.indexOf(selectedUser)
+                if (selectedPosition >= 0) {
+                    viewBinding.viewPager.setCurrentItem(selectedPosition, false)
+                }
             }
-
-            mViewPagerAdapter.notifyDataSetChanged()
         } catch (e: Exception) {
             Log.e(TAG, "Error in scanUser: ${e.message}")
         }
     }
 
+    private fun refreshInstances() {
+        val users = BlackBoxCore.get().users.sortedBy { it.id }
+        instanceIds = users.map { it.id }
+        instanceNames = users.associate { it.id to (it.name ?: "Instance ${it.id}") }
+        if (currentUser !in instanceIds) {
+            currentUser = instanceIds.firstOrNull() ?: -1
+        }
+        updateUserRemark(currentUser)
+    }
+
+    private fun createInstance() {
+        try {
+            val nextId = (instanceIds.maxOrNull() ?: -1) + 1
+            val created = BlackBoxCore.get().createUser(nextId)
+            if (created == null) {
+                Log.e(TAG, "Unable to create virtual instance id=$nextId")
+                return
+            }
+            currentUser = created.id
+            scanUser()
+            val position = instanceIds.indexOf(created.id)
+            if (position >= 0) viewBinding.viewPager.setCurrentItem(position, false)
+        } catch (e: Exception) {
+            Log.e(TAG, "Instance creation failed", e)
+        }
+    }
+
+    private fun deleteCurrentInstance() {
+        if (currentUser < 0) return
+        val name = instanceNames[currentUser] ?: "Instance $currentUser"
+        MaterialDialog(this).show {
+            title(text = getString(R.string.instance_delete_title, name))
+            message(res = R.string.instance_delete_message)
+            positiveButton(res = R.string.done) {
+                try {
+                    BlackBoxCore.get().deleteUser(currentUser)
+                    val deletedId = currentUser
+                    AppManager.mRemarkSharedPreferences.edit {
+                        remove("Remark$deletedId")
+                        remove("AppList$deletedId")
+                    }
+                    currentUser = -1
+                    scanUser()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Instance deletion failed: id=$currentUser", e)
+                }
+            }
+            negativeButton(res = R.string.cancel)
+        }
+    }
+
     private fun updateUserRemark(userId: Int) {
         try {
-            var remark =
-                    AppManager.mRemarkSharedPreferences.getString("Remark$userId", "User $userId")
-            if (remark.isNullOrEmpty()) {
-                remark = "User $userId"
-            }
-
-            viewBinding.toolbarLayout.toolbar.subtitle = remark
+            viewBinding.toolbarLayout.toolbar.subtitle =
+                    if (userId < 0) "No instance selected" else instanceNames[userId] ?: "Instance $userId"
         } catch (e: Exception) {
             Log.e(TAG, "Error updating user remark: ${e.message}")
-            viewBinding.toolbarLayout.toolbar.subtitle = "User $userId"
+            viewBinding.toolbarLayout.toolbar.subtitle = if (userId < 0) "No instance selected" else "Instance $userId"
         }
     }
 
@@ -377,10 +426,16 @@ class MainActivity : LoadingActivity() {
                 try {
                     if (it.resultCode == RESULT_OK) {
                         it.data?.let { data ->
-                            val userId = data.getIntExtra("userID", 0)
+                            val userId = data.getIntExtra("userID", -1)
                             val source = data.getStringExtra("source")
-                            if (source != null) {
-                                fragmentList[userId].installApk(source)
+                            val fragmentPosition = instanceIds.indexOf(userId)
+                            val fragment = if (fragmentPosition >= 0) {
+                                supportFragmentManager.fragments
+                                        .filterIsInstance<AppsFragment>()
+                                        .firstOrNull { it.userID == userId }
+                            } else null
+                            if (source != null && fragment != null) {
+                                fragment.installApk(source)
                             }
                         }
                     }
@@ -413,6 +468,12 @@ class MainActivity : LoadingActivity() {
                 R.id.main_setting -> {
                     SettingActivity.start(this)
                 }
+                R.id.instance_create -> {
+                    createInstance()
+                }
+                R.id.instance_delete -> {
+                    deleteCurrentInstance()
+                }
                 R.id.main_tg -> {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/newblackboxa"))
                     startActivity(intent)
@@ -420,7 +481,7 @@ class MainActivity : LoadingActivity() {
                 R.id.fake_location -> {
                     
                     val intent = Intent(this, FakeManagerActivity::class.java)
-                    intent.putExtra("userID", 0)
+                    intent.putExtra("userID", currentUser.coerceAtLeast(0))
                     startActivity(intent)
                 }
             }
