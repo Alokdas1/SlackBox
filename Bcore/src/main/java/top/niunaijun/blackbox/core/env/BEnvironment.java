@@ -11,6 +11,8 @@ import top.niunaijun.blackbox.utils.FileUtils;
 public class BEnvironment {
     private static final File sVirtualRoot = new File(BlackBoxCore.getContext().getCacheDir().getParent(), "blackbox");
     private static final File sExternalVirtualRoot = BlackBoxCore.getContext().getExternalFilesDir("blackbox");
+    private static final InstanceStorageLayout sStorageLayout =
+            new InstanceStorageLayout(sVirtualRoot, sExternalVirtualRoot);
 
     public static File JUNIT_JAR = new File(getCacheDir(), "junit.apk");
     public static File EMPTY_JAR = new File(getCacheDir(), "empty.apk");
@@ -72,11 +74,11 @@ public class BEnvironment {
     }
 
     public static File getExternalUserDir(int userId) {
-        return new File(sExternalVirtualRoot, String.format(Locale.CHINA, "storage/emulated/%d/", userId));
+        return sStorageLayout.externalUserRoot(userId);
     }
 
     public static File getUserDir(int userId) {
-        return new File(sVirtualRoot, String.format(Locale.CHINA, "data/user/%d", userId));
+        return sStorageLayout.credentialUserRoot(userId);
     }
 
     /**
@@ -84,7 +86,7 @@ public class BEnvironment {
      * encrypted application data and must be removed with the instance.
      */
     public static File getUserDeDir(int userId) {
-        return new File(sVirtualRoot, String.format(Locale.CHINA, "data/user_de/%d", userId));
+        return sStorageLayout.deviceUserRoot(userId);
     }
 
     /**
@@ -93,7 +95,7 @@ public class BEnvironment {
      * and package-manager paths stay stable.
      */
     public static File getInstanceMetadataDir(int userId) {
-        return new File(sVirtualRoot, String.format(Locale.CHINA, "instances/%d/metadata", userId));
+        return sStorageLayout.metadataRoot(userId);
     }
 
     public static File getInstanceConfigFile(int userId) {
@@ -101,21 +103,21 @@ public class BEnvironment {
     }
 
     public static File getExternalObbDir(String packageName, int userId) {
-        return new File(getExternalUserDir(userId), String.format(Locale.CHINA, "Android/obb/%s", packageName));
+        return sStorageLayout.packageObb(packageName, userId);
     }
 
 
     public static File getDeDataDir(String packageName, int userId) {
-        return new File(sVirtualRoot, String.format(Locale.CHINA, "data/user_de/%d/%s", userId, packageName));
+        return sStorageLayout.packageDeviceData(packageName, userId);
     }
 
     public static File getExternalDataDir(String packageName, int userId) {
-        return new File(getExternalUserDir(userId), String.format(Locale.CHINA, "Android/data/%s", packageName));
+        return sStorageLayout.packageExternalData(packageName, userId);
     }
 
 
     public static File getDataDir(String packageName, int userId) {
-        return new File(sVirtualRoot, String.format(Locale.CHINA, "data/user/%d/%s", userId, packageName));
+        return sStorageLayout.packageData(packageName, userId);
     }
 
     public static File getProcDir(int pid) {
