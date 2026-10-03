@@ -676,7 +676,7 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                 args[getPermissionIndex()] = null;
             }
 
-            if (BuildCompat.isU()) {
+            if (BuildCompat.isTiramisu()) {
                 int flagsIndex = args.length - 1;
                 int flags = (int)args[flagsIndex];
                 if((flags & RECEIVER_NOT_EXPORTED) == 0 && (flags & RECEIVER_EXPORTED) == 0){

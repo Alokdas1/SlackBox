@@ -17,12 +17,20 @@ public class BuildCompat {
 
     
     public static boolean isU() {
-        return Build.VERSION.SDK_INT >= 33 || (Build.VERSION.SDK_INT >= 32 && Build.VERSION.PREVIEW_SDK_INT == 1);
+        return isU(Build.VERSION.SDK_INT, getPreviewSDKInt());
     }
 
     
     public static boolean isTiramisu() {
-        return Build.VERSION.SDK_INT >= 32 || (Build.VERSION.SDK_INT >= 31 && Build.VERSION.PREVIEW_SDK_INT == 1);
+        return isTiramisu(Build.VERSION.SDK_INT, getPreviewSDKInt());
+    }
+
+    static boolean isU(int sdkInt, int previewSdkInt) {
+        return sdkInt >= 34 || (sdkInt >= 33 && previewSdkInt == 1);
+    }
+
+    static boolean isTiramisu(int sdkInt, int previewSdkInt) {
+        return sdkInt >= 33 || (sdkInt >= 32 && previewSdkInt == 1);
     }
 
     
