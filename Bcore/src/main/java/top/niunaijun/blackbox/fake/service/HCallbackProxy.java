@@ -4,6 +4,7 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ServiceInfo;
+import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
@@ -34,6 +35,7 @@ import top.niunaijun.blackbox.fake.hook.IInjectHook;
 import top.niunaijun.blackbox.proxy.ProxyManifest;
 import top.niunaijun.blackbox.proxy.record.ProxyActivityRecord;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.CrashMonitor;
 import top.niunaijun.blackbox.utils.compat.BuildCompat;
 
 
@@ -145,6 +147,10 @@ public class HCallbackProxy implements IInjectHook, Handler.Callback {
         ProxyActivityRecord stubRecord = ProxyActivityRecord.create(intent);
         ActivityInfo activityInfo = stubRecord.mActivityInfo;
         if (activityInfo != null) {
+            CrashMonitor.recordEvent("activity_launch_dispatched", activityInfo.packageName,
+                    activityInfo.processName, stubRecord.mUserId, activityInfo.name,
+                    "sdk=" + Build.VERSION.SDK_INT + ", guestTargetSdk="
+                            + activityInfo.applicationInfo.targetSdkVersion);
             if (BActivityThread.getAppConfig() == null) {
                 BlackBoxCore.getBActivityManager().restartProcess(activityInfo.packageName, activityInfo.processName, stubRecord.mUserId);
 

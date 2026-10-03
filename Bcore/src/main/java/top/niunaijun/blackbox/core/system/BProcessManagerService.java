@@ -28,6 +28,7 @@ import top.niunaijun.blackbox.core.system.user.BUserHandle;
 import top.niunaijun.blackbox.entity.AppConfig;
 import top.niunaijun.blackbox.proxy.ProxyManifest;
 import top.niunaijun.blackbox.utils.FileUtils;
+import top.niunaijun.blackbox.utils.CrashMonitor;
 import top.niunaijun.blackbox.utils.Slog;
 import top.niunaijun.blackbox.utils.compat.ApplicationThreadCompat;
 import top.niunaijun.blackbox.utils.compat.BundleCompat;
@@ -173,6 +174,9 @@ public class BProcessManagerService implements ISystemService {
                 @Override
                 public void binderDied() {
                     Log.d(TAG, "App Died: " + app.processName);
+                    CrashMonitor.recordEvent("guest_process_binder_died", app.getPackageName(),
+                            app.processName, app.userId, "",
+                            "cause=unknown; Binder death does not distinguish crash from normal exit");
                     appThread.unlinkToDeath(this, 0);
                     onProcessDie(app);
                 }

@@ -43,4 +43,18 @@ public class CrashMonitorTest {
         }
         throw new AssertionError("Reporter failure must propagate after forwarding");
     }
+
+    @Test
+    public void guestEventLineEscapesFieldsAndIncludesInstanceContext() {
+        String line = CrashMonitor.formatEventLine("java_crash", "game.package",
+                "game.package:render", 7, "game.package.MainActivity", "bad \"surface\"\nstate");
+
+        assertTrue(line.startsWith("{\"time_ms\":"));
+        assertTrue(line.contains("\"event\":\"java_crash\""));
+        assertTrue(line.contains("\"package\":\"game.package\""));
+        assertTrue(line.contains("\"process\":\"game.package:render\""));
+        assertTrue(line.contains("\"instance\":7"));
+        assertTrue(line.contains("bad \\\"surface\\\"\\nstate"));
+        assertTrue(line.endsWith("}\n"));
+    }
 }

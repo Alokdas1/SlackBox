@@ -8,8 +8,10 @@ import android.os.Build;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
@@ -17,6 +19,8 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import top.niunaijun.blackbox.BlackBoxCore;
 import top.niunaijun.blackbox.app.BActivityThread;
@@ -36,6 +40,69 @@ public class CrashMonitor {
     
     
     private static Thread.UncaughtExceptionHandler sPreviousExceptionHandler;
+    private static final Object sEventLogLock = new Object();
+    private static final ExecutorService sEventWriter = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "SlackBox-Diagnostics");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /** Persists guest lifecycle breadcrumbs so the host can explain a process that vanished. */
+    public static void recordEvent(String event, String packageName, String processName,
+                                   int userId, String component, String detail) {
+        Context context = BlackBoxCore.getContext();
+        if (context == null) return;
+        String json = formatEventLine(event, packageName, processName, userId, component, detail);
+        File eventFile = new File(new File(context.getFilesDir(), "crash_logs"), "guest_events.jsonl");
+        sEventWriter.execute(() -> {
+            File directory = eventFile.getParentFile();
+            if (directory == null || (!directory.exists() && !directory.mkdirs() && !directory.isDirectory())) {
+                Slog.w(TAG, "Unable to create guest diagnostics directory");
+                return;
+            }
+            synchronized (sEventLogLock) {
+                try (FileOutputStream output = new FileOutputStream(eventFile, true);
+                     java.nio.channels.FileLock ignored = output.getChannel().lock()) {
+                    output.write(json.getBytes(StandardCharsets.UTF_8));
+                } catch (IOException e) {
+                    Slog.w(TAG, "Unable to persist guest lifecycle event: " + event, e);
+                }
+            }
+        });
+    }
+
+    static String formatEventLine(String event, String packageName, String processName,
+                                  int userId, String component, String detail) {
+        return "{\"time_ms\":" + System.currentTimeMillis()
+                + ",\"event\":\"" + jsonEscape(event)
+                + "\",\"package\":\"" + jsonEscape(packageName)
+                + "\",\"process\":\"" + jsonEscape(processName)
+                + "\",\"instance\":" + userId
+                + ",\"component\":\"" + jsonEscape(component)
+                + "\",\"detail\":\"" + jsonEscape(detail) + "\"}\n";
+    }
+
+    private static String jsonEscape(String value) {
+        if (value == null) return "";
+        StringBuilder escaped = new StringBuilder(value.length() + 8);
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            if (character == '\\' || character == '"') {
+                escaped.append('\\').append(character);
+            } else if (character == '\n') {
+                escaped.append("\\n");
+            } else if (character == '\r') {
+                escaped.append("\\r");
+            } else if (character == '\t') {
+                escaped.append("\\t");
+            } else if (character < 0x20) {
+                escaped.append(String.format("\\u%04x", (int) character));
+            } else {
+                escaped.append(character);
+            }
+        }
+        return escaped.toString();
+    }
     public static class CrashInfo {
         public final String crashType;
         public final String packageName;
@@ -151,6 +218,18 @@ public class CrashMonitor {
             
             
             CrashInfo crashInfo = createCrashInfo(crashType, thread, throwable);
+
+            String processName = "unknown";
+            int userId = -1;
+            try {
+                processName = BActivityThread.getAppProcessName();
+                userId = BActivityThread.getUserId();
+            } catch (Throwable ignored) {
+                // Host and early-startup crashes may not have a bound virtual process.
+            }
+            recordEvent("java_crash", crashInfo.packageName, processName, userId, "",
+                    throwable == null ? "unknown" : throwable.getClass().getName() + ": "
+                            + String.valueOf(throwable.getMessage()));
             
             
             Slog.w(TAG, "Crash detected: " + crashInfo);
@@ -224,7 +303,7 @@ public class CrashMonitor {
                 logDir.mkdirs();
             }
             
-            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date(crashInfo.timestamp));
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS").format(new Date(crashInfo.timestamp));
             File logFile = new File(logDir, "crash_" + timestamp + ".log");
             
             try (PrintWriter writer = new PrintWriter(new FileWriter(logFile))) {

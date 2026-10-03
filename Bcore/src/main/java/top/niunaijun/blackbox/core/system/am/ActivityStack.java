@@ -9,6 +9,7 @@ import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
 import android.content.res.TypedArray;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -38,6 +39,7 @@ import top.niunaijun.blackbox.proxy.ProxyActivity;
 import top.niunaijun.blackbox.proxy.ProxyManifest;
 import top.niunaijun.blackbox.proxy.record.ProxyActivityRecord;
 import top.niunaijun.blackbox.utils.ComponentUtils;
+import top.niunaijun.blackbox.utils.CrashMonitor;
 import top.niunaijun.blackbox.utils.Slog;
 import top.niunaijun.blackbox.utils.compat.ActivityManagerCompat;
 
@@ -309,6 +311,9 @@ public class ActivityStack {
         if (targetApp == null) {
             throw new RuntimeException("Unable to create process, name:" + info.name);
         }
+        CrashMonitor.recordEvent("activity_start_requested", info.packageName, info.processName,
+                userId, info.name, "deviceAbis=" + java.util.Arrays.toString(Build.SUPPORTED_ABIS)
+                        + ", hostProcess64Bit=" + android.os.Process.is64Bit());
         return getStartStubActivityIntentInner(intent, targetApp.bpid, userId, stubRecord, info);
     }
 

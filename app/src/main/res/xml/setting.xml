@@ -36,6 +36,11 @@
                 android:title="Send Logs"
                 android:summary="Upload debug logs to developer" />
 
+        <Preference
+                android:key="view_guest_diagnostics"
+                android:title="Guest diagnostics"
+                android:summary="View recent virtual app launches, process exits, and Java crashes on this device" />
+
     </PreferenceCategory>
 
 </PreferenceScreen>
