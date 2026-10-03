@@ -84,7 +84,7 @@ public class BActivityManager extends BlackManager<IBActivityManagerService> {
         }
     }
 
-    public void startActivity(Intent intent, int userId) {
+    public boolean startActivity(Intent intent, int userId) {
         int retryCount = 0;
         final int maxRetries = 3;
         
@@ -92,8 +92,14 @@ public class BActivityManager extends BlackManager<IBActivityManagerService> {
             try {
                 IBActivityManagerService service = getService();
                 if (service != null) {
-                    service.startActivity(intent, userId);
-                    return; 
+                    boolean started = service.startActivity(intent, userId);
+                    if (!started) {
+                        String target = intent.getComponent() == null ? intent.getPackage()
+                                : intent.getComponent().flattenToShortString();
+                        Slog.e(TAG, "Virtual activity dispatch rejected for instance " + userId
+                                + ": " + target);
+                    }
+                    return started;
                 } else {
                     Slog.w(TAG, "ActivityManager service is null, retry " + (retryCount + 1) + "/" + maxRetries);
                     
@@ -101,7 +107,7 @@ public class BActivityManager extends BlackManager<IBActivityManagerService> {
                         Thread.sleep(200 * (retryCount + 1)); 
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
-                        break;
+                        return false;
                     }
                 }
             } catch (DeadObjectException e) {
@@ -115,15 +121,16 @@ public class BActivityManager extends BlackManager<IBActivityManagerService> {
                 }
             } catch (RemoteException e) {
                 Slog.e(TAG, "RemoteException in startActivity", e);
-                break; 
+                return false;
             } catch (Exception e) {
                 Slog.e(TAG, "Unexpected error in startActivity", e);
-                break;
+                return false;
             }
             retryCount++;
         }
         
         Slog.e(TAG, "Failed to start activity after " + maxRetries + " retries");
+        return false;
     }
 
     public int startActivityAms(int userId, Intent intent, String resolvedType, IBinder resultTo, String resultWho, int requestCode, int flags, Bundle options) {

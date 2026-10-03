@@ -6,12 +6,20 @@ import android.os.Build;
 import android.os.IBinder;
 
 import black.android.app.BRActivity;
+import black.android.app.BRActivityManager;
 import black.android.app.BRActivityManagerNative;
 import black.android.app.BRIActivityManager;
 import black.android.app.BRIActivityManagerL;
 import black.android.app.BRIActivityManagerN;
 
 public class ActivityManagerCompat {
+	public static int startIntentNotResolved() {
+		try {
+			return BRActivityManager.get().START_INTENT_NOT_RESOLVED();
+		} catch (Throwable ignored) {
+			return -1;
+		}
+	}
 	
 	public static final int SERVICE_DONE_EXECUTING_ANON = 0;
 	

@@ -1090,8 +1090,11 @@ public class BlackBoxCore extends ClientConfiguration {
         if (launchIntentForPackage == null) {
             return false;
         }
-        startActivity(launchIntentForPackage, userId);
-        return true;
+        if (mClientConfiguration.isEnableLauncherActivity()) {
+            LauncherActivity.launch(launchIntentForPackage, userId);
+            return true;
+        }
+        return getBActivityManager().startActivity(launchIntentForPackage, userId);
     }
     public boolean isInstalled(String packageName, int userId) {
         return getBPackageManager().isInstalled(packageName, userId);

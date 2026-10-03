@@ -28,6 +28,7 @@ import top.niunaijun.blackbox.entity.am.ReceiverData;
 import top.niunaijun.blackbox.entity.am.RunningAppProcessInfo;
 import top.niunaijun.blackbox.entity.am.RunningServiceInfo;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.CrashMonitor;
 
 import static android.content.pm.PackageManager.GET_META_DATA;
 
@@ -364,10 +365,22 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
     }
 
     @Override
-    public void startActivity(Intent intent, int userId) {
-        UserSpace userSpace = getOrCreateSpaceLocked(userId);
-        synchronized (userSpace.mStack) {
-            userSpace.mStack.startActivityLocked(userId, intent, null, null, null, -1, -1, null);
+    public boolean startActivity(Intent intent, int userId) {
+        try {
+            UserSpace userSpace = getOrCreateSpaceLocked(userId);
+            synchronized (userSpace.mStack) {
+                int result = userSpace.mStack.startActivityLocked(
+                        userId, intent, null, null, null, -1, -1, null);
+                return result >= 0;
+            }
+        } catch (RuntimeException e) {
+            String packageName = intent.getComponent() == null ? intent.getPackage()
+                    : intent.getComponent().getPackageName();
+            String componentName = intent.getComponent() == null ? "" : intent.getComponent().flattenToShortString();
+            Slog.e(TAG, "Unable to dispatch guest activity for instance " + userId, e);
+            CrashMonitor.recordEvent("activity_start_failed", packageName, "unknown",
+                    userId, componentName, e.getClass().getName() + ": " + String.valueOf(e.getMessage()));
+            return false;
         }
     }
 

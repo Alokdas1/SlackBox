@@ -138,7 +138,11 @@ public class ActivityStack {
 
         ResolveInfo resolveInfo = BPackageManagerService.get().resolveActivity(intent, GET_ACTIVITIES, resolvedType, userId);
         if (resolveInfo == null || resolveInfo.activityInfo == null) {
-            return 0;
+            String requestedComponent = intent.getComponent() == null ? intent.getPackage()
+                    : intent.getComponent().flattenToShortString();
+            Slog.w(TAG, "No virtual Activity matched launch request for instance " + userId
+                    + ": " + requestedComponent);
+            return ActivityManagerCompat.startIntentNotResolved();
         }
         Log.d(TAG, "startActivityLocked : " + resolveInfo.activityInfo);
         ActivityInfo activityInfo = resolveInfo.activityInfo;
@@ -327,8 +331,19 @@ public class ActivityStack {
         shadow.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         shadow.addFlags(launchMode);
 
-        BlackBoxCore.getContext().startActivity(shadow);
-        return 0;
+        try {
+            BlackBoxCore.getContext().startActivity(shadow);
+            CrashMonitor.recordEvent("activity_start_result", activityInfo.packageName,
+                    activityInfo.processName, userId, activityInfo.name, "proxy task accepted");
+            return 0;
+        } catch (RuntimeException e) {
+            Slog.e(TAG, "Unable to start proxy task for guest Activity "
+                    + activityInfo.packageName + "/" + activityInfo.name, e);
+            CrashMonitor.recordEvent("activity_start_failed", activityInfo.packageName,
+                    activityInfo.processName, userId, activityInfo.name,
+                    e.getClass().getName() + ": " + String.valueOf(e.getMessage()));
+            return ActivityManagerCompat.startIntentNotResolved();
+        }
     }
 
     private int startActivityInSourceTask(Intent intent, String resolvedType,
@@ -342,23 +357,39 @@ public class ActivityStack {
         if (resultTo == null) {
             shadow.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         }
-        return realStartActivityLocked(sourceRecord.processRecord.appThread, shadow, resolvedType, resultTo, resultWho, requestCode, flags, options);
+        return realStartActivityLocked(sourceRecord.processRecord.appThread, shadow, resolvedType,
+                resultTo, resultWho, requestCode, flags, options, activityInfo, userId);
     }
 
     private int realStartActivityLocked(IInterface appThread, Intent intent, String resolvedType,
                                         IBinder resultTo, String resultWho, int requestCode, int flags,
-                                        Bundle options) {
+                                        Bundle options, ActivityInfo guestActivity, int userId) {
         try {
             flags &= ~ActivityManagerCompat.START_FLAG_DEBUG;
             flags &= ~ActivityManagerCompat.START_FLAG_NATIVE_DEBUGGING;
             flags &= ~ActivityManagerCompat.START_FLAG_TRACK_ALLOCATION;
 
-            BRIActivityManager.get(BRActivityManagerNative.get().getDefault()).startActivity(appThread, BlackBoxCore.getHostPkg(), intent,
+            Integer result = BRIActivityManager.get(BRActivityManagerNative.get().getDefault()).startActivity(appThread, BlackBoxCore.getHostPkg(), intent,
                     resolvedType, resultTo, resultWho, requestCode, flags, null, options);
+            if (result == null) {
+                Slog.e(TAG, "ActivityManager returned null while launching guest activity "
+                        + guestActivity.packageName + "/" + guestActivity.name);
+                CrashMonitor.recordEvent("activity_start_failed", guestActivity.packageName,
+                        guestActivity.processName, userId, guestActivity.name,
+                        "ActivityManager returned null start result");
+                return ActivityManagerCompat.startIntentNotResolved();
+            }
+            CrashMonitor.recordEvent("activity_start_result", guestActivity.packageName,
+                    guestActivity.processName, userId, guestActivity.name, "result=" + result);
+            return result;
         } catch (Throwable e) {
-            e.printStackTrace();
+            Slog.e(TAG, "ActivityManager handoff failed for guest activity "
+                    + guestActivity.packageName + "/" + guestActivity.name, e);
+            CrashMonitor.recordEvent("activity_start_failed", guestActivity.packageName,
+                    guestActivity.processName, userId, guestActivity.name,
+                    e.getClass().getName() + ": " + String.valueOf(e.getMessage()));
+            return ActivityManagerCompat.startIntentNotResolved();
         }
-        return 0;
     }
 
     private ActivityRecord getTopActivityRecord() {

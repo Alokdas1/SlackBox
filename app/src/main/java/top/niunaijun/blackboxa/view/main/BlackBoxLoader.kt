@@ -244,6 +244,8 @@ class BlackBoxLoader {
                                     }
                                 }
 
+                                override fun isEnableLauncherActivity(): Boolean = false
+
                                 override fun isEnableDaemonService(): Boolean {
                                     return try {
                                         mDaemonEnable
