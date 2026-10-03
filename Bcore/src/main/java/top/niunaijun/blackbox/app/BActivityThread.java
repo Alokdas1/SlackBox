@@ -809,14 +809,6 @@ public class BActivityThread extends IBActivityThread.Stub {
                 return;
             }
 
-            // Skip known anti-virtual-environment detection providers.
-            // These providers detect the sandbox and call System.exit() to kill the app.
-            // By skipping them, the app continues to run normally.
-            if (providerInfo.name != null && isAntiDetectProvider(providerInfo.name)) {
-                Slog.w(TAG, "Skipping anti-detect ContentProvider: " + providerInfo.name);
-                return;
-            }
-
             ClassLoader classLoader = application.getClassLoader();
             if (classLoader == null) {
                 Slog.w(TAG, "Application class loader is null, using system class loader for: " + providerInfo.name);
@@ -835,29 +827,6 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
     }
 
-    /**
-     * Check if a ContentProvider is a known anti-virtual-environment detector.
-     * These providers detect sandboxed environments and force-kill the app.
-     */
-    private static boolean isAntiDetectProvider(String className) {
-        String lower = className.toLowerCase();
-        // Meituan Hades anti-cheat
-        return lower.contains("hades")
-                || lower.contains("ztuni")
-                // Douyin/TikTok security
-                || lower.contains("securityguard")
-                || lower.contains("avdetector")
-                // Common detection patterns
-                || lower.contains("virtualdetect")
-                || lower.contains("sandboxdetect")
-                || lower.contains("emulatordetect")
-                || lower.contains("fridadetect")
-                || lower.contains("hookdetect")
-                || lower.contains("xposeddetect")
-                || lower.contains("magiskdetect");
-    }
-    
-    
     private void setApplication(Application application) {
         try {
             mInitialApplication = application;
@@ -1020,16 +989,13 @@ public class BActivityThread extends IBActivityThread.Stub {
         try {
             for (ProviderInfo providerInfo : provider) {
                 try {
-                    // Skip known anti-virtual-environment detection providers.
-                    if (providerInfo.name != null && isAntiDetectProvider(providerInfo.name)) {
-                        Slog.w(TAG, "Skipping anti-detect ContentProvider: " + providerInfo.name);
-                        continue;
-                    }
                     if (processName.equals(providerInfo.processName) ||
                             providerInfo.processName.equals(context.getPackageName()) || providerInfo.multiprocess) {
                         installProvider(BlackBoxCore.mainThread(), context, providerInfo, null);
                     }
-                } catch (Throwable ignored) {
+                } catch (Throwable error) {
+                    Slog.e(TAG, "Failed to install virtual provider " + providerInfo.packageName + "/"
+                            + providerInfo.name + " in " + processName, error);
                 }
             }
         } finally {
