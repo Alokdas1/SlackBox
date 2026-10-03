@@ -10,9 +10,8 @@ public class CreatePackageExecutor implements Executor {
 
     @Override
     public int exec(BPackageSettings ps, InstallOption option, int userId) {
-        FileUtils.deleteDir(BEnvironment.getAppDir(ps.pkg.packageName));
-
-        
+        // Package code is shared by virtual users; installing into another user
+        // must not erase the APK and native libraries used by existing users.
         FileUtils.mkdirs(BEnvironment.getAppDir(ps.pkg.packageName));
         FileUtils.mkdirs(BEnvironment.getAppLibDir(ps.pkg.packageName));
         return 0;

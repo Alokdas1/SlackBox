@@ -3,17 +3,15 @@ package top.niunaijun.blackbox.utils;
 import android.os.Build;
 import android.util.Log;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.Enumeration;
+import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import top.niunaijun.blackbox.BlackBoxCore;
 
 
 public class NativeUtils {
@@ -21,84 +19,41 @@ public class NativeUtils {
 
     public static void copyNativeLib(File apk, File nativeLibDir) throws Exception {
         long startTime = System.currentTimeMillis();
-        if (!nativeLibDir.exists()) {
-            nativeLibDir.mkdirs();
-        }
+        if (!nativeLibDir.exists() && !nativeLibDir.mkdirs())
+            throw new java.io.IOException("Unable to create native library directory: " + nativeLibDir);
         try (ZipFile zipfile = new ZipFile(apk.getAbsolutePath())) {
-            if (findAndCopyNativeLib(zipfile, Build.CPU_ABI, nativeLibDir)) {
+            Set<String> packagedAbis = AbiUtils.packagedAbis(zipfile);
+            String abi = AbiUtils.selectAbi(packagedAbis, BlackBoxCore.is64Bit(), Build.SUPPORTED_ABIS);
+            if (abi == null) {
+                if (!packagedAbis.isEmpty()) throw new java.io.IOException(
+                        "APK native ABIs " + packagedAbis + " cannot run in this " +
+                                (BlackBoxCore.is64Bit() ? "64-bit" : "32-bit") + " SlackBox process");
                 return;
             }
-
-            findAndCopyNativeLib(zipfile, "armeabi", nativeLibDir);
+            copyAbi(zipfile, abi, nativeLibDir);
         } finally {
             Log.d(TAG, "Done! +" + (System.currentTimeMillis() - startTime) + "ms");
         }
     }
 
-
-    private static boolean findAndCopyNativeLib(ZipFile zipfile, String cpuArch, File nativeLibDir) throws Exception {
-        Log.d(TAG, "Try to copy plugin's cup arch: " + cpuArch);
-        boolean findLib = false;
-        boolean findSo = false;
-        byte buffer[] = null;
+    private static void copyAbi(ZipFile zipfile, String cpuArch, File nativeLibDir) throws Exception {
+        Log.d(TAG, "Copying guest native libraries for ABI: " + cpuArch);
         String libPrefix = "lib/" + cpuArch + "/";
-        ZipEntry entry;
-        Enumeration e = zipfile.entries();
-
-        while (e.hasMoreElements()) {
-            entry = (ZipEntry) e.nextElement();
+        byte[] buffer = new byte[16 * 1024];
+        Enumeration<? extends ZipEntry> entries = zipfile.entries();
+        while (entries.hasMoreElements()) {
+            ZipEntry entry = entries.nextElement();
             String entryName = entry.getName();
-            if (!findLib && !entryName.startsWith("lib/")) {
-                continue;
-            }
-            findLib = true;
-            if (!entryName.endsWith(".so") || !entryName.startsWith(libPrefix)) {
-                continue;
-            }
-
-            if (buffer == null) {
-                findSo = true;
-                Log.d(TAG, "Found plugin's cup arch dir: " + cpuArch);
-                buffer = new byte[8192];
-            }
-
-            String libName = entryName.substring(entryName.lastIndexOf('/') + 1);
-            Log.d(TAG, "verify so " + libName);
-
-
-
-
-
+            if (entry.isDirectory() || !entryName.startsWith(libPrefix) || !entryName.endsWith(".so")) continue;
+            String libName = entryName.substring(libPrefix.length());
+            if (libName.isEmpty() || libName.contains("/")) continue;
             File libFile = new File(nativeLibDir, libName);
-            if (libFile.exists() && libFile.length() == entry.getSize()) {
-                Log.d(TAG, libName + " skip copy");
-                continue;
+            Log.d(TAG, "Extracting " + entryName);
+            try (InputStream input = zipfile.getInputStream(entry);
+                 FileOutputStream output = new FileOutputStream(libFile)) {
+                int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
             }
-            FileOutputStream fos = new FileOutputStream(libFile);
-            Log.d(TAG, "copy so " + entry.getName() + " of " + cpuArch);
-            copySo(buffer, zipfile.getInputStream(entry), fos);
         }
-
-        if (!findLib) {
-            Log.d(TAG, "Fast skip all!");
-            return true;
-        }
-
-        return findSo;
-    }
-
-    private static void copySo(byte[] buffer, InputStream input, OutputStream output) throws IOException {
-        BufferedInputStream bufferedInput = new BufferedInputStream(input);
-        BufferedOutputStream bufferedOutput = new BufferedOutputStream(output);
-        int count;
-
-        while ((count = bufferedInput.read(buffer)) > 0) {
-            bufferedOutput.write(buffer, 0, count);
-        }
-        bufferedOutput.flush();
-        bufferedOutput.close();
-        output.close();
-        bufferedInput.close();
-        input.close();
     }
 }
