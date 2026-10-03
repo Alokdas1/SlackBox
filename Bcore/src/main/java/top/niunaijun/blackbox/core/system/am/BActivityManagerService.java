@@ -196,13 +196,33 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
         }
         mBroadcastManager.sendBroadcast(pendingResultData);
         for (ResolveInfo resolve : resolves) {
-            ProcessRecord processRecord = BProcessManagerService.get().findProcessRecord(resolve.activityInfo.packageName, resolve.activityInfo.processName, userId);
-            if (processRecord != null) {
+            if (resolve.activityInfo == null) {
+                continue;
+            }
+            ProcessRecord processRecord = BProcessManagerService.get().findProcessRecord(
+                    resolve.activityInfo.packageName, resolve.activityInfo.processName, userId);
+            if (processRecord == null) {
+                processRecord = BProcessManagerService.get().startProcessLocked(
+                        resolve.activityInfo.packageName,
+                        resolve.activityInfo.processName,
+                        userId,
+                        -1,
+                        Binder.getCallingPid());
+            }
+            if (processRecord == null || processRecord.bActivityThread == null) {
+                Slog.w(TAG, "Unable to start virtual receiver process: package="
+                        + resolve.activityInfo.packageName + ", receiver=" + resolve.activityInfo.name
+                        + ", userId=" + userId);
+                continue;
+            }
+            try {
                 ReceiverData data = new ReceiverData();
                 data.intent = intent;
                 data.activityInfo = resolve.activityInfo;
                 data.data = pendingResultData;
                 processRecord.bActivityThread.scheduleReceiver(data);
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Failed to schedule virtual receiver: " + resolve.activityInfo.name, e);
             }
         }
     }
