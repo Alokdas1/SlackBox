@@ -37,6 +37,16 @@ public class ActiveServices {
     private final Map<IBinder, RunningServiceRecord> mRunningTokens = new HashMap<>();
     private final Map<IBinder, ConnectedServiceRecord> mConnectedServices = new HashMap<>();
 
+    public void clearForUserRemoval() {
+        synchronized (mRunningServiceRecords) {
+            mRunningServiceRecords.clear();
+            mRunningTokens.clear();
+        }
+        synchronized (mConnectedServices) {
+            mConnectedServices.clear();
+        }
+    }
+
     public void startService(Intent intent, String resolvedType, boolean requireForeground, int userId) {
         ResolveInfo resolveInfo = resolveService(intent, resolvedType, userId);
         if (resolveInfo == null)
@@ -113,7 +123,10 @@ public class ActiveServices {
             runningServiceRecord.mServiceInfo = serviceInfo;
 
             if (binder != null) {
-                ConnectedServiceRecord connectedService = mConnectedServices.get(binder);
+                ConnectedServiceRecord connectedService;
+                synchronized (mConnectedServices) {
+                    connectedService = mConnectedServices.get(binder);
+                }
                 boolean isBound = false;
                 if (connectedService != null) {
                     isBound = true;
@@ -124,7 +137,9 @@ public class ActiveServices {
                             @Override
                             public void binderDied() {
                                 binder.unlinkToDeath(this, 0);
-                                mConnectedServices.remove(binder);
+                                synchronized (mConnectedServices) {
+                                    mConnectedServices.remove(binder);
+                                }
                             }
                         }, 0);
                     } catch (RemoteException e) {
@@ -132,7 +147,9 @@ public class ActiveServices {
                     }
                     connectedService.mIBinder = binder;
                     connectedService.mIntent = intent;
-                    mConnectedServices.put(binder, connectedService);
+                    synchronized (mConnectedServices) {
+                        mConnectedServices.put(binder, connectedService);
+                    }
                 }
 
                 if (!isBound) {
@@ -145,14 +162,19 @@ public class ActiveServices {
     }
 
     public void unbindService(IBinder binder, int userId) {
-        ConnectedServiceRecord connectedService = mConnectedServices.get(binder);
+        ConnectedServiceRecord connectedService;
+        synchronized (mConnectedServices) {
+            connectedService = mConnectedServices.get(binder);
+        }
         if (connectedService == null) {
             return;
         }
         RunningServiceRecord runningServiceRecord = getOrCreateRunningServiceRecord(connectedService.mIntent);
         runningServiceRecord.mConnectedServiceRecord = null;
         runningServiceRecord.mBindCount.decrementAndGet();
-        mConnectedServices.remove(binder);
+        synchronized (mConnectedServices) {
+            mConnectedServices.remove(binder);
+        }
     }
 
     public void stopServiceToken(ComponentName className, IBinder token, int userId) {

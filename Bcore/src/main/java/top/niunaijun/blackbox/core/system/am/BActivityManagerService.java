@@ -20,6 +20,7 @@ import top.niunaijun.blackbox.core.system.BProcessManagerService;
 import top.niunaijun.blackbox.core.system.ISystemService;
 import top.niunaijun.blackbox.core.system.ProcessRecord;
 import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
+import top.niunaijun.blackbox.core.system.user.BUserManagerService;
 import top.niunaijun.blackbox.entity.AppConfig;
 import top.niunaijun.blackbox.entity.UnbindRecord;
 import top.niunaijun.blackbox.entity.am.PendingResultData;
@@ -40,6 +41,16 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
 
     public static BActivityManagerService get() {
         return sService;
+    }
+
+    public void removeUser(int userId) {
+        UserSpace userSpace;
+        synchronized (mUserSpace) {
+            userSpace = mUserSpace.remove(userId);
+        }
+        if (userSpace != null) {
+            userSpace.clearForUserRemoval(userId);
+        }
     }
 
     public BActivityManagerService() {
@@ -382,7 +393,11 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
             if (userSpace != null)
                 return userSpace;
             userSpace = new UserSpace();
-            mUserSpace.put(userId, userSpace);
+            // Delayed service/binder callbacks may arrive after an instance is
+            // destroyed. Do not retain new runtime state for a missing user.
+            if (BUserManagerService.get().exists(userId)) {
+                mUserSpace.put(userId, userSpace);
+            }
             return userSpace;
         }
     }

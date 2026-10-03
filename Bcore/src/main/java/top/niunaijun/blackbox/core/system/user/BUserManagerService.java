@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.List;
 
 import top.niunaijun.blackbox.core.env.BEnvironment;
+import top.niunaijun.blackbox.core.system.am.BActivityManagerService;
 import top.niunaijun.blackbox.core.system.ISystemService;
 import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
 import top.niunaijun.blackbox.utils.CloseUtils;
@@ -101,16 +102,16 @@ public class BUserManagerService extends IBUserManagerService.Stub implements IS
     @Override
     public void deleteUser(int userId) throws RemoteException {
         synchronized (mUserLock) {
+            BPackageManagerService.get().deleteUser(userId);
             synchronized (mUsers) {
-                BPackageManagerService.get().deleteUser(userId);
-
                 mUsers.remove(userId);
                 saveUserInfoLocked();
-                FileUtils.deleteDir(BEnvironment.getUserDir(userId));
-                FileUtils.deleteDir(BEnvironment.getUserDeDir(userId));
-                FileUtils.deleteDir(BEnvironment.getExternalUserDir(userId));
-                FileUtils.deleteDir(BEnvironment.getInstanceMetadataDir(userId).getParentFile());
             }
+            BActivityManagerService.get().removeUser(userId);
+            FileUtils.deleteDir(BEnvironment.getUserDir(userId));
+            FileUtils.deleteDir(BEnvironment.getUserDeDir(userId));
+            FileUtils.deleteDir(BEnvironment.getExternalUserDir(userId));
+            FileUtils.deleteDir(BEnvironment.getInstanceMetadataDir(userId).getParentFile());
         }
     }
 

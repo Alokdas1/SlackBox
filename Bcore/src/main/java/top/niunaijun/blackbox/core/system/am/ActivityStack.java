@@ -73,6 +73,42 @@ public class ActivityStack {
         mAms = (ActivityManager) BlackBoxCore.getContext().getSystemService(Context.ACTIVITY_SERVICE);
     }
 
+    public void clearForUserRemoval(int userId) {
+        Set<Integer> removedTaskIds = new HashSet<>();
+        synchronized (mTasks) {
+            java.util.Iterator<Map.Entry<Integer, TaskRecord>> iterator = mTasks.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Integer, TaskRecord> entry = iterator.next();
+                if (entry.getValue().userId == userId) {
+                    removedTaskIds.add(entry.getKey());
+                    iterator.remove();
+                }
+            }
+        }
+        synchronized (mLaunchingActivities) {
+            java.util.Iterator<ActivityRecord> iterator = mLaunchingActivities.iterator();
+            while (iterator.hasNext()) {
+                ActivityRecord record = iterator.next();
+                if (record.userId == userId) {
+                    mHandler.removeMessages(LAUNCH_TIME_OUT, record);
+                    iterator.remove();
+                }
+            }
+        }
+        if (removedTaskIds.isEmpty()) {
+            return;
+        }
+        try {
+            for (ActivityManager.AppTask task : mAms.getAppTasks()) {
+                if (removedTaskIds.contains(task.getTaskInfo().id)) {
+                    task.finishAndRemoveTask();
+                }
+            }
+        } catch (RuntimeException e) {
+            Slog.w(TAG, "Unable to remove recent tasks for deleted virtual user " + userId, e);
+        }
+    }
+
     public boolean containsFlag(Intent intent, int flag) {
         return (intent.getFlags() & flag) != 0;
     }
