@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.os.PersistableBundle;
 import android.util.Log;
 import android.view.Display;
+import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
@@ -17,6 +18,7 @@ import android.view.ViewGroup;
 import android.view.Window;
 
 import java.lang.reflect.Field;
+import java.util.WeakHashMap;
 
 import black.android.app.BRActivity;
 import black.android.app.BRActivityThread;
@@ -38,6 +40,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     private static final String TAG = AppInstrumentation.class.getSimpleName();
 
     private static AppInstrumentation sAppInstrumentation;
+    private static final WeakHashMap<SurfaceView, Boolean> sTrackedSurfaceViews = new WeakHashMap<>();
 
     private static final class SurfaceCounts {
         int surfaceViews;
@@ -202,7 +205,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             try {
                 if (activity.isFinishing() || activity.isDestroyed()) return;
                 SurfaceCounts surfaces = new SurfaceCounts();
-                countRenderSurfaces(decor, surfaces);
+                countRenderSurfaces(decor, surfaces, activity);
                 Display display = activity.getDisplay();
                 float refreshRate = display == null ? 0f : display.getRefreshRate();
                 String detail = "width=" + decor.getWidth()
@@ -224,11 +227,13 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         }, 500L);
     }
 
-    private static void countRenderSurfaces(View view, SurfaceCounts counts) {
+    private static void countRenderSurfaces(View view, SurfaceCounts counts, Activity activity) {
         if (view instanceof SurfaceView) {
+            SurfaceView surfaceView = (SurfaceView) view;
+            trackSurfaceView(surfaceView, activity);
             counts.surfaceViews++;
             try {
-                if (((SurfaceView) view).getHolder().getSurface().isValid()) {
+                if (surfaceView.getHolder().getSurface().isValid()) {
                     counts.validSurfaceViews++;
                 }
             } catch (RuntimeException ignored) {
@@ -241,8 +246,74 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
             for (int index = 0; index < group.getChildCount(); index++) {
-                countRenderSurfaces(group.getChildAt(index), counts);
+                countRenderSurfaces(group.getChildAt(index), counts, activity);
             }
+        }
+    }
+
+    private static void trackSurfaceView(SurfaceView view, Activity activity) {
+        synchronized (sTrackedSurfaceViews) {
+            if (sTrackedSurfaceViews.containsKey(view)) return;
+            try {
+                SurfaceHolder holder = view.getHolder();
+                AppConfig config = BActivityThread.getAppConfig();
+                if (config == null) return;
+                String packageName = config.packageName;
+                String processName = config.processName;
+                int userId = config.userId;
+                String component = activity.getClass().getName();
+                holder.addCallback(new SurfaceHolder.Callback() {
+                    @Override
+                    public void surfaceCreated(SurfaceHolder callbackHolder) {
+                        recordSurfaceEvent("render_surface_created", packageName, processName,
+                                userId, component, callbackHolder, 0, 0, 0);
+                    }
+
+                    @Override
+                    public void surfaceChanged(SurfaceHolder callbackHolder, int format,
+                                               int width, int height) {
+                        recordSurfaceEvent("render_surface_changed", packageName, processName,
+                                userId, component, callbackHolder, format, width, height);
+                    }
+
+                    @Override
+                    public void surfaceDestroyed(SurfaceHolder callbackHolder) {
+                        recordSurfaceEvent("render_surface_destroyed", packageName, processName,
+                                userId, component, callbackHolder, 0, 0, 0);
+                    }
+                });
+                sTrackedSurfaceViews.put(view, Boolean.TRUE);
+                recordGuestEvent("render_surface_observed", packageName, processName, userId,
+                        component, "valid=" + holder.getSurface().isValid()
+                                + ",width=" + view.getWidth() + ",height=" + view.getHeight());
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Unable to observe guest SurfaceView", error);
+            }
+        }
+    }
+
+    private static void recordSurfaceEvent(String event, String packageName, String processName,
+                                          int userId, String component, SurfaceHolder holder,
+                                          int format, int width, int height) {
+        boolean valid;
+        try {
+            valid = holder.getSurface().isValid();
+        } catch (RuntimeException error) {
+            valid = false;
+        }
+        String detail = "valid=" + valid;
+        if (event.endsWith("changed")) {
+            detail += ",format=" + format + ",width=" + width + ",height=" + height;
+        }
+        recordGuestEvent(event, packageName, processName, userId, component, detail);
+    }
+
+    private static void recordGuestEvent(String event, String packageName, String processName,
+                                         int userId, String component, String detail) {
+        try {
+            CrashMonitor.recordEvent(event, packageName, processName, userId, component, detail);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Unable to record guest surface event: " + event, error);
         }
     }
 
