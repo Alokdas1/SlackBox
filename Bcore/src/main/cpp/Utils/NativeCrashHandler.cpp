@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <ucontext.h>
+#include <unwind.h>
 
 #include "Dobby/dobby.h"
 #include "xdl.h"
@@ -131,6 +132,19 @@ void chainToPrevious(int signalNumber, siginfo_t *info, void *context) {
     raise(signalNumber);
 }
 
+// Stack capture, shared by the signal handler and the abort() hook. Defined
+// below with the rest of the abort interception; declared here because
+// handleSignal() records a backtrace too.
+const int kMaxTraceFrames = 32;
+uintptr_t g_traceFrames[kMaxTraceFrames];
+volatile sig_atomic_t g_traceFrameCount = 0;
+
+int captureTraceFrames();
+void appendRawFrameRecord(char *out, size_t capacity, const char *tag, uintptr_t pc);
+void appendModuleRecord(char *out, size_t capacity, const char *tag, uintptr_t pc);
+void commitRecord(const char *record);
+void dumpProcMaps();
+
 void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
     if (g_reentered) {
         _exit(128 + signalNumber);
@@ -163,11 +177,22 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
     appendLiteral(line, sizeof(line), &length, "\n");
     line[length < sizeof(line) ? length : sizeof(line) - 1] = '\0';
 
-    // Commit the async-signal-safe essentials before consulting the dynamic
+// Commit the async-signal-safe essentials before consulting the dynamic
     // linker. dladdr() is not async-signal-safe; if it faults while the loader
     // lock is held, a re-entry would otherwise _exit before writing any report.
     appendRecordToFile(g_internalPath, &g_internalReady, line, length);
     appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+
+    // Raw program counters first, still without the loader lock. On SIGBUS and
+    // SIGSEGV the fault address in si_addr is the single most useful field and
+    // it is already in the line above; the stack is what turns it into a file
+    // and an offset.
+    int frameCount = captureTraceFrames();
+    for (int i = 0; i < frameCount; i++) {
+        char frameLine[256];
+        appendRawFrameRecord(frameLine, sizeof(frameLine), "native_crash_frame", g_traceFrames[i]);
+        commitRecord(frameLine);
+    }
 
     if (programCounter != nullptr) {
         Dl_info symbol;
@@ -180,19 +205,35 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
             appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength,
                           signalName(signalNumber));
             appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength, " pc=0x");
-            appendHex(moduleLine, sizeof(moduleLine), &moduleLength,
+            appendHex(moduleLine, sizeof(moduleLength), &moduleLength,
                       (uintptr_t) programCounter);
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength, " lib=");
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength, symbol.dli_fname);
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength, "+0x");
-            appendHex(moduleLine, sizeof(moduleLine), &moduleLength,
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, " lib=");
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, symbol.dli_fname);
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "+0x");
+            appendHex(moduleLine, sizeof(moduleLength), &moduleLength,
                       (uintptr_t) programCounter - (uintptr_t) symbol.dli_fbase);
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength, "\n");
-            moduleLine[moduleLength < sizeof(moduleLine) ? moduleLength : sizeof(moduleLine) - 1] = '\0';
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "\n");
+            moduleLine[moduleLength < sizeof(moduleLength) ? moduleLength : sizeof(moduleLength) - 1] = '\0';
             appendRecordToFile(g_internalPath, &g_internalReady, moduleLine, moduleLength);
             appendRecordToFile(g_sharedPath, &g_sharedReady, moduleLine, moduleLength);
             __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", moduleLine);
         }
+    }
+
+    for (int i = 0; i < frameCount; i++) {
+        char symbolLine[512];
+        appendModuleRecord(symbolLine, sizeof(symbolLine), "native_crash_symbol", g_traceFrames[i]);
+        commitRecord(symbolLine);
+    }
+
+    dumpProcMaps();
+
+    // The durable record is already written. Logcat is a best-effort extra
+    // channel because Android logging is not async-signal-safe either.
+    __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", line);
+
+    chainToPrevious(signalNumber, info, rawContext);
+}
     }
 
     // The durable record is already written. Logcat is a best-effort extra
@@ -279,6 +320,26 @@ static void ensureHandlersArmed() {
         if (ourHandlerIsInstalled(kHandledSignals[i])) {
             continue;
         }
+        // Somebody replaced us. Record who before taking it back, so a crash that
+        // still bypasses this handler can be traced to the library that owns the
+        // disposition at that moment instead of being guessed at.
+        struct sigaction current;
+        memset(&current, 0, sizeof(current));
+        if (sigaction(kHandledSignals[i], nullptr, &current) == 0 &&
+            current.sa_sigaction != handleSignal) {
+            char stolenLine[512];
+            appendModuleRecord(stolenLine, sizeof(stolenLine), "native_crash_displaced",
+                               (uintptr_t) current.sa_sigaction);
+            size_t len = strlen(stolenLine);
+            while (len > 0 && stolenLine[len - 1] != '\n') {
+                stolenLine[--len] = '\0';
+            }
+            size_t used = len;
+            appendLiteral(stolenLine, sizeof(stolenLine), &used, " signal=");
+            appendLiteral(stolenLine, sizeof(stolenLine), &used, signalName(kHandledSignals[i]));
+            appendLiteral(stolenLine, sizeof(stolenLine), &used, "\n");
+            commitRecord(stolenLine);
+        }
         struct sigaction action;
         memset(&action, 0, sizeof(action));
         action.sa_sigaction = handleSignal;
@@ -303,67 +364,190 @@ static void ensureHandlersArmed() {
 // makes the record unconditional: it is the last point before the process dies
 // and no other library can take it from us.
 //
+// Measured on com.proxima.dfm at t+45.6s: the guest's own crash reporter caught
+// SIGBUS(7), and its own termination path called abort(). The kernel still
+// reported the original fatal signal, so the exit reason stays SIGNALED/7 while
+// the abort hook is the only place the fault is visible. That is why this hook
+// unwinds a real stack instead of logging one return address -- the frame above
+// abort() is inside libc (fault_addr came back 0x0 and no module line was
+// emitted), so a single pc names libc and nothing else.
+//
 // Everything below runs with the same async-signal-safe constraints as the
-// signal handler: no allocation, no stdio, raw syscalls only.
+// signal handler: no allocation, no stdio, raw syscalls only. The raw program
+// counters are committed to disk before dladdr() is consulted, because dladdr
+// takes the loader lock and can fault if that lock is already held.
 
 static void (*orig_abort)(void) = nullptr;
 
-// Walk the caller stack to find the first frame outside libc, so the record
-// points at the code that called abort() rather than at abort() itself.
-static void *callerFrame(void *pc) {
+_Unwind_Reason_Code collectTraceFrame(struct _Unwind_Context *context, void *argument) {
+    (void) argument;
+    if (g_traceFrameCount >= kMaxTraceFrames) {
+        return _URC_END_OF_STACK;
+    }
+    uintptr_t pc = (uintptr_t) _Unwind_GetIP(context);
+    if (pc == 0) {
+        return _URC_END_OF_STACK;
+    }
+    g_traceFrames[g_traceFrameCount++] = pc;
+    return _URC_NO_REASON;
+}
+
+int captureTraceFrames() {
+    g_traceFrameCount = 0;
+    _Unwind_Backtrace(collectTraceFrame, nullptr);
+    return (int) g_traceFrameCount;
+}
+
+static bool addressIsInLibc(uintptr_t pc) {
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (dladdr(pc, &info) == 0 || info.dli_fname == nullptr) {
-        return nullptr;
+    if (dladdr((void *) pc, &info) == 0 || info.dli_fname == nullptr) {
+        return false;
     }
-    if (strstr(info.dli_fname, "/libc.so") != nullptr) {
-        return nullptr;
+    return strstr(info.dli_fname, "/libc.so") != nullptr;
+}
+
+// First frame that is not libc. The frame directly above abort() belongs to
+// libc's own terminate path (__libc_fatal, __fortify_fail, __stack_chk_fail),
+// so naming it would only ever produce "libc.so". Returns the caller pc itself
+// when the whole visible stack is libc, so the record still carries something.
+static void *firstNonLibcFrame(const uintptr_t *frames, int count) {
+    for (int i = 0; i < count; i++) {
+        if (!addressIsInLibc(frames[i])) {
+            return (void *) frames[i];
+        }
     }
-    return pc;
+    if (count > 0) {
+        return (void *) frames[0];
+    }
+    return nullptr;
+}
+
+void appendModuleRecord(char *out, size_t capacity, const char *tag,
+                               uintptr_t pc) {
+    size_t length = 0;
+    appendLiteral(out, capacity, &length, tag);
+    appendLiteral(out, capacity, &length, " pc=0x");
+    appendHex(out, capacity, &length, pc);
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr((void *) pc, &info) != 0 && info.dli_fname != nullptr) {
+        appendLiteral(out, capacity, &length, " lib=");
+        appendLiteral(out, capacity, &length, info.dli_fname);
+        appendLiteral(out, capacity, &length, "+0x");
+        appendHex(out, capacity, &length, pc - (uintptr_t) info.dli_fbase);
+        const char *symbol = info.dli_sname != nullptr ? info.dli_sname : "?";
+        appendLiteral(out, capacity, &length, " sym=");
+        appendLiteral(out, capacity, &length, symbol);
+    } else {
+        // dladdr failing is itself a finding: it means the address is outside
+        // every loaded object, which is what an unmapped or JIT page looks like.
+        appendLiteral(out, capacity, &length, " lib=<unresolved> pc_is_unmapped=1");
+    }
+    appendLiteral(out, capacity, &length, "\n");
+    out[capacity - 1] = '\0';
+}
+
+void appendRawFrameRecord(char *out, size_t capacity, const char *tag,
+                                 uintptr_t pc) {
+    size_t length = 0;
+    appendLiteral(out, capacity, &length, tag);
+    appendLiteral(out, capacity, &length, " pc=0x");
+    appendHex(out, capacity, &length, pc);
+    appendLiteral(out, capacity, &length, "\n");
+    out[capacity - 1] = '\0';
+}
+
+void commitRecord(const char *record) {
+    size_t length = strlen(record);
+    appendRecordToFile(g_internalPath, &g_internalReady, record, length);
+    appendRecordToFile(g_sharedPath, &g_sharedReady, record, length);
+    __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", record);
+}
+
+// Snapshot of the address space at the moment of death. Without it, frames that
+// dladdr cannot resolve cannot be attributed after the process is gone.
+void dumpProcMaps() {
+    long fd = syscall(__NR_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    char mapPath[256];
+    size_t pathLength = 0;
+    appendLiteral(mapPath, sizeof(mapPath), &pathLength, g_sharedPath);
+    // native_crash_1234.log -> native_maps_1234.log
+    const char *lastSlash = strrchr(mapPath, '/');
+    if (lastSlash != nullptr) {
+        pathLength = (size_t) (lastSlash - mapPath) + 1;
+    } else {
+        pathLength = 0;
+    }
+    appendLiteral(mapPath, sizeof(mapPath), &pathLength, "native_maps_");
+    appendSigned(mapPath, sizeof(mapPath), &pathLength, (long) getpid());
+    appendLiteral(mapPath, sizeof(mapPath), &pathLength, ".log\n");
+
+    long out = syscall(__NR_openat, AT_FDCWD, mapPath,
+                       O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (out < 0) {
+        syscall(__NR_close, fd);
+        return;
+    }
+    char buffer[4096];
+    for (;;) {
+        long got = syscall(__NR_read, fd, buffer, sizeof(buffer));
+        if (got <= 0) {
+            break;
+        }
+        syscall(__NR_write, out, buffer, (size_t) got);
+    }
+    syscall(__NR_close, out);
+    syscall(__NR_close, fd);
 }
 
 static void my_abort() {
-    // __builtin_return_address(0) is the caller of abort(), i.e. the game.
-    void *pc = (void *) __builtin_return_address(0);
-    void *reported = callerFrame(pc);
+    int frameCount = captureTraceFrames();
+    uintptr_t callerPc = (uintptr_t) __builtin_return_address(0);
+    void *reported = frameCount > 0 ? firstNonLibcFrame(g_traceFrames, frameCount)
+                                    : (void *) callerPc;
 
+    // 1. Essentials, async-signal-safe, no loader lock.
     char line[512];
     size_t length = 0;
     appendLiteral(line, sizeof(line), &length, "native_crash signal=SIGABRT(6) tid=");
     appendSigned(line, sizeof(line), &length, (long) gettid());
     appendLiteral(line, sizeof(line), &length, " source=abort()");
+    appendLiteral(line, sizeof(line), &length, " frames=");
+    appendSigned(line, sizeof(line), &length, frameCount);
     appendLiteral(line, sizeof(line), &length, " fault_addr=0x");
     appendHex(line, sizeof(line), &length, (uintptr_t) reported);
     appendLiteral(line, sizeof(line), &length, " pc=0x");
-    appendHex(line, sizeof(line), &length, (uintptr_t) pc);
+    appendHex(line, sizeof(line), &length, callerPc);
     appendLiteral(line, sizeof(line), &length, "\n");
     line[length < sizeof(line) ? length : sizeof(line) - 1] = '\0';
-    appendRecordToFile(g_internalPath, &g_internalReady, line, length);
-    appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+    commitRecord(line);
 
-    if (reported != nullptr) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr(reported, &info) != 0 && info.dli_fname != nullptr) {
-            char moduleLine[512];
-            size_t moduleLength = 0;
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength,
-                          "native_crash_module signal=SIGABRT(6) pc=0x");
-            appendHex(moduleLine, sizeof(moduleLength), &moduleLength, (uintptr_t) reported);
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, " lib=");
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, info.dli_fname);
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "+0x");
-            appendHex(moduleLine, sizeof(moduleLength), &moduleLength,
-                      (uintptr_t) reported - (uintptr_t) info.dli_fbase);
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "\n");
-            moduleLine[moduleLength < sizeof(moduleLength) ? moduleLength
-                                                          : sizeof(moduleLength) - 1] = '\0';
-            appendRecordToFile(g_internalPath, &g_internalReady, moduleLine, moduleLength);
-            appendRecordToFile(g_sharedPath, &g_sharedReady, moduleLine, moduleLength);
-            __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", moduleLine);
-        }
+    // 2. Raw program counters, still no loader lock. These survive even if the
+    //    resolution pass below faults.
+    for (int i = 0; i < frameCount; i++) {
+        char frameLine[256];
+        appendRawFrameRecord(frameLine, sizeof(frameLine), "native_crash_frame", g_traceFrames[i]);
+        commitRecord(frameLine);
     }
-    __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", line);
+
+    // 3. Resolution pass. Loader lock from here on.
+    if (reported != nullptr) {
+        char moduleLine[512];
+        appendModuleRecord(moduleLine, sizeof(moduleLine),
+                           "native_crash_module signal=SIGABRT(6)", (uintptr_t) reported);
+        commitRecord(moduleLine);
+    }
+    for (int i = 0; i < frameCount; i++) {
+        char symbolLine[512];
+        appendModuleRecord(symbolLine, sizeof(symbolLine), "native_crash_symbol", g_traceFrames[i]);
+        commitRecord(symbolLine);
+    }
+
+    dumpProcMaps();
 
     if (orig_abort != nullptr) {
         orig_abort();
