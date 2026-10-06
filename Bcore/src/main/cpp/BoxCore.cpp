@@ -133,19 +133,26 @@ bool disableResourceLoading(JNIEnv *env, jclass clazz) {
 }
 
 void installNativeCrashHandler(JNIEnv *env, jclass clazz, jstring internal_directory,
-                               jstring shared_directory) {
+                               jstring shared_directory, jstring download_directory) {
     const char *internal = env->GetStringUTFChars(internal_directory, JNI_FALSE);
     const char *shared = shared_directory != nullptr
                          ? env->GetStringUTFChars(shared_directory, JNI_FALSE)
                          : nullptr;
-    ALOGD("set installNativeCrashHandler: internal=%s shared=%s",
-          internal != nullptr ? internal : "(none)", shared != nullptr ? shared : "(none)");
-    NativeCrashHandler::install(internal, shared);
+    const char *download = download_directory != nullptr
+                           ? env->GetStringUTFChars(download_directory, JNI_FALSE)
+                           : nullptr;
+    ALOGD("set installNativeCrashHandler: internal=%s shared=%s download=%s",
+          internal != nullptr ? internal : "(none)", shared != nullptr ? shared : "(none)",
+          download != nullptr ? download : "(none)");
+    NativeCrashHandler::install(internal, shared, download);
     if (internal != nullptr) {
         env->ReleaseStringUTFChars(internal_directory, internal);
     }
     if (shared != nullptr) {
         env->ReleaseStringUTFChars(shared_directory, shared);
+    }
+    if (download != nullptr) {
+        env->ReleaseStringUTFChars(download_directory, download);
     }
 }
 
