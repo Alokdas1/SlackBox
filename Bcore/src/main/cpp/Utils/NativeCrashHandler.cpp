@@ -234,14 +234,6 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
 
     chainToPrevious(signalNumber, info, rawContext);
 }
-    }
-
-    // The durable record is already written. Logcat is a best-effort extra
-    // channel because Android logging is not async-signal-safe either.
-    __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", line);
-
-    chainToPrevious(signalNumber, info, rawContext);
-}
 
 // Records that the write path works, before any crash has happened. If the file
 // exists but never grows a crash line, the handler is not being invoked -- which
