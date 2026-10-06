@@ -190,6 +190,7 @@ void dumpProcMaps();
 int walkInterruptedStack(uintptr_t *out, int maxFrames, uintptr_t framePointer,
                          uintptr_t linkRegister, uintptr_t anchorSp);
 static void noteForeignHandler(int index, const struct sigaction *act);
+static void writeModeProbe();
 static void installOurHandler(int signum);
 
 void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
@@ -569,6 +570,11 @@ void dumpProcMaps() {
         char mapPath[256];
         size_t pathLength = 0;
         appendLiteral(mapPath, sizeof(mapPath), &pathLength, sinks[s]);
+        // Terminate before scanning: appendLiteral() does not terminate, so
+        // strrchr() ran off into uninitialised stack looking for the separator,
+        // produced a garbage path, and the open failed. That is why no
+        // native_maps_<pid>.log ever appeared on any run.
+        mapPath[pathLength < sizeof(mapPath) ? pathLength : sizeof(mapPath) - 1] = '\0';
         // native_crash_1234.log -> native_maps_1234.log
         const char *lastSlash = strrchr(mapPath, '/');
         pathLength = lastSlash != nullptr ? (size_t) (lastSlash - mapPath) + 1 : 0;
@@ -686,6 +692,18 @@ static int indexOfSignal(int signum) {
 
 // Deduplicates: both the sigaction hook and the re-arm backstop funnel through
 // here, and without this the file filled with repeats of the same owner.
+// Records a foreign handler for a signal. Deliberately performs no file I/O and
+// no logging.
+//
+// This runs inside somebody else's sigaction() call, six times during guest
+// startup. The previous version opened and wrote three files and called
+// __android_log_write from there, on a caller's stack and possibly while that
+// caller held a lock that logd or the filesystem also wants. Observation has to
+// be inert: note the owner in memory, set a flag, and let the one-second thread
+// do the writing in flushDisplacementLog().
+static volatile sig_atomic_t g_displaced[kHandledCount];
+static struct sigaction g_loggedForeign[kHandledCount];
+
 static void noteForeignHandler(int index, const struct sigaction *act) {
     if (index < 0 || act == nullptr) {
         return;
@@ -694,20 +712,37 @@ static void noteForeignHandler(int index, const struct sigaction *act) {
         return;
     }
     g_previous[index] = *act;
+    g_displaced[index] = 1;
+}
 
-    char line[512];
-    appendModuleRecord(line, sizeof(line), "native_crash_displaced",
-                       (uintptr_t) act->sa_sigaction);
-    size_t length = strlen(line);
-    while (length > 0 && line[length - 1] != '\n') {
-        line[--length] = '\0';
+// Runs on the re-arm thread, never in a signal path. One record per owner, so
+// the file does not fill with repeats.
+static void flushDisplacementLog() {
+    for (int i = 0; i < kHandledCount; i++) {
+        if (g_displaced[i] == 0) {
+            continue;
+        }
+        g_displaced[i] = 0;
+        if (g_previous[i].sa_sigaction == 0 ||
+            g_loggedForeign[i].sa_sigaction == g_previous[i].sa_sigaction) {
+            continue;
+        }
+        g_loggedForeign[i] = g_previous[i];
+
+        char line[512];
+        appendModuleRecord(line, sizeof(line), "native_crash_displaced",
+                           (uintptr_t) g_previous[i].sa_sigaction);
+        size_t length = strlen(line);
+        while (length > 0 && line[length - 1] != '\n') {
+            line[--length] = '\0';
+        }
+        size_t used = length;
+        appendLiteral(line, sizeof(line), &used, " signal=");
+        appendLiteral(line, sizeof(line), &used, signalName(kHandledSignals[i]));
+        appendLiteral(line, sizeof(line), &used, " disposition=wrapped_owned_by_us=1\n");
+        line[used < sizeof(line) ? used : sizeof(line) - 1] = '\0';
+        commitRecord(line);
     }
-    size_t used = length;
-    appendLiteral(line, sizeof(line), &used, " signal=");
-    appendLiteral(line, sizeof(line), &used, signalName(kHandledSignals[index]));
-    appendLiteral(line, sizeof(line), &used, " disposition=wrapped_owned_by_us=1\n");
-    line[used < sizeof(line) ? used : sizeof(line) - 1] = '\0';
-    commitRecord(line);
 }
 
 static void installOurHandler(int signum) {
@@ -758,6 +793,24 @@ static void installSigactionHook() {
     DobbyHook(target, (void *) my_sigaction, (void **) &orig_sigaction);
 }
 
+// Whether to wrap sigaction() and keep ourselves outermost for the fatal
+// signals. Off by default: see install(). Flip to true to A/B the wrap against
+// the guest rendering again.
+const bool kWrapSigaction = false;
+
+// Records which mode is live, so a crash log states whether the wrap was in
+// effect instead of leaving it to be inferred from absent lines.
+static void writeModeProbe() {
+    char line[192];
+    size_t length = 0;
+    appendLiteral(line, sizeof(line), &length, "native_crash_mode ");
+    appendLiteral(line, sizeof(line), &length,
+                  "sigaction_wrap=off abort_hook=on fatal_signals=reporter_owned");
+    appendLiteral(line, sizeof(line), &length, "\n");
+    line[length < sizeof(line) ? length : sizeof(line) - 1] = '\0';
+    writeRecordToAllSinks(line, length);
+}
+
 // A game engine and its crash reporter install their own fatal-signal handlers
 // well after the guest binds, silently replacing ours. This thread notices and
 // re-arms, but only for the signals whose disposition actually drifted.
@@ -767,7 +820,11 @@ void *rearmLoop(void *) {
         pause.tv_sec = 1;
         pause.tv_nsec = 0;
         nanosleep(&pause, nullptr);
+        if (!kWrapSigaction) {
+            continue;
+        }
         ensureHandlersArmed();
+        flushDisplacementLog();
     }
     return nullptr;
 }
@@ -796,10 +853,26 @@ void NativeCrashHandler::install(const char *internalDirectory, const char *shar
     sigaltstack(&alternate, nullptr);
 
     writeArmProbe();
-    armHandlers();
-    // Order matters: sigaction is wrapped before abort so a reporter that
-    // installs handlers during its own init is already captured.
-    installSigactionHook();
+    if (kWrapSigaction) {
+        armHandlers();
+        // Order matters: sigaction is wrapped before abort so a reporter that
+        // installs handlers during its own init is already captured.
+        installSigactionHook();
+    } else {
+        // Default mode. The game's crash reporter owns the fatal signals and we
+        // do not contest them; the abort() hook below is the attribution path.
+        //
+        // Wrapping sigaction is a semantic change, not merely an observation. A
+        // reporter that queries its own disposition with
+        // sigaction(SIGSEGV, NULL, &old) gets our address back instead of its
+        // own, and we re-install with our own flags, dropping any
+        // SA_RESETHAND/SA_NODEFER it relied on. Measured on com.proxima.dfm,
+        // enabling the wrap coincided with the guest stopping rendering
+        // entirely -- zero activity_started and zero render_surface_observed,
+        // against a 2400x1080 surface before it -- with every death becoming an
+        // immediate SIGSEGV at fault_addr=0x0.
+        writeModeProbe();
+    }
     installAbortHook();
 
     pthread_t watchdog;
