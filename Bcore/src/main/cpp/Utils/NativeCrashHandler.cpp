@@ -198,12 +198,21 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
 
     void *faultAddress = info != nullptr ? info->si_addr : nullptr;
     void *programCounter = nullptr;
+    uintptr_t framePointer = 0;
+    uintptr_t linkRegister = 0;
+    uintptr_t stackPointer = 0;
     ucontext_t *context = (ucontext_t *) rawContext;
     if (context != nullptr) {
 #if defined(__aarch64__)
         programCounter = (void *) context->uc_mcontext.pc;
+        framePointer = (uintptr_t) context->uc_mcontext.regs[29];
+        linkRegister = (uintptr_t) context->uc_mcontext.regs[30];
+        stackPointer = (uintptr_t) context->uc_mcontext.sp;
 #elif defined(__arm__)
         programCounter = (void *) context->uc_mcontext.arm_pc;
+        framePointer = (uintptr_t) context->uc_mcontext.arm_fp;
+        linkRegister = (uintptr_t) context->uc_mcontext.arm_lr;
+        stackPointer = (uintptr_t) context->uc_mcontext.arm_sp;
 #endif
     }
 
@@ -231,7 +240,8 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
     // SIGSEGV the fault address in si_addr is the single most useful field and
     // it is already in the line above; the stack is what turns it into a file
     // and an offset.
-    int frameCount = captureTraceFrames();
+    int frameCount = walkInterruptedStack(g_traceFrames, kMaxTraceFrames,
+                                          framePointer, linkRegister, stackPointer);
     for (int i = 0; i < frameCount; i++) {
         char frameLine[256];
         appendRawFrameRecord(frameLine, sizeof(frameLine), "native_crash_frame", g_traceFrames[i]);
@@ -241,6 +251,14 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
     if (programCounter != nullptr) {
         Dl_info symbol;
         memset(&symbol, 0, sizeof(symbol));
+        {
+            // Written unconditionally: on pid 17877 dladdr() failed for the
+            // faulting pc (0x681f0dc8, an unmapped/JIT page) and the record was
+            // skipped, so the one address that mattered went unrecorded.
+            char pcRecord[512];
+            appendModuleRecord(pcRecord, sizeof(pcRecord), "native_crash_pc", (uintptr_t) programCounter);
+            commitRecord(pcRecord);
+        }
         if (dladdr(programCounter, &symbol) != 0 && symbol.dli_fname != nullptr) {
             char moduleLine[512];
             size_t moduleLength = 0;
@@ -411,6 +429,73 @@ int captureTraceFrames() {
     return (int) g_traceFrameCount;
 }
 
+// --- stack walking across a signal boundary ----------------------------------
+//
+// _Unwind_Backtrace is the wrong tool inside a signal handler here, for two
+// reasons, both observed on com.proxima.dfm pid 17877:
+//
+//  1. It cannot cross the signal frame. That run returned exactly two frames --
+//     libblackbox.so+0x2778c (the handler trampoline) and then [vdso] with
+//     sym=__kernel_rt_sigreturn -- and stopped. The faulting context was never
+//     reached, so the backtrace named our own code and told us nothing.
+//
+//  2. Running it there is not safe. It faults while reading a stack that is
+//     already broken, which re-enters the handler and hits the g_reentered guard
+//     -> _exit(128 + 11). Android then reported reason=EXIT_SELF status=139 and
+//     the guest crash-looped immediately instead of dying once at ~48s.
+//
+// The interrupted context is the one place where the guest's real stack is
+// available, so read it directly: seed from the ucontext frame/link registers,
+// then walk the frame chain by hand. Every pointer is range-checked before it
+// is dereferenced, so a corrupt stack ends the walk instead of faulting.
+const uintptr_t kUserAddressLimit = 0x0000FFFFFFFFFFFFULL; // 48-bit user VA
+const uintptr_t kStackWindowBytes = 512 * 1024;
+
+static bool plausibleCodeAddress(uintptr_t pc) {
+    return pc != 0 && pc < kUserAddressLimit && (pc & 0x3) == 0;
+}
+
+static bool plausibleStackPointer(uintptr_t sp, uintptr_t anchorSp) {
+    if ((sp & 0x7) != 0) {
+        return false;
+    }
+    // Callers sit at higher addresses than the frame we are standing in.
+    if (sp < anchorSp) {
+        return false;
+    }
+    return sp - anchorSp < kStackWindowBytes;
+}
+
+int walkInterruptedStack(uintptr_t *out, int maxFrames, uintptr_t framePointer,
+                         uintptr_t linkRegister, uintptr_t anchorSp) {
+    int count = 0;
+    uintptr_t sp = anchorSp;
+
+    if (plausibleCodeAddress(linkRegister) && count < maxFrames) {
+        out[count++] = linkRegister;
+    }
+
+    uintptr_t fp = framePointer;
+    for (int step = 0; step < maxFrames && count < maxFrames; step++) {
+        if (!plausibleStackPointer(fp, sp)) {
+            break;
+        }
+        // Validate both words we are about to read before reading either.
+        uintptr_t nextFp = *(uintptr_t *) fp;
+        uintptr_t returnPc = *(uintptr_t *) (fp + sizeof(uintptr_t));
+        if (!plausibleCodeAddress(returnPc)) {
+            break;
+        }
+        out[count++] = returnPc;
+        if (!plausibleStackPointer(nextFp, fp) || nextFp == fp) {
+            break;
+        }
+        sp = fp;
+        fp = nextFp;
+    }
+    return count;
+}
+
 static bool addressIsInLibc(uintptr_t pc) {
     Dl_info info;
     memset(&info, 0, sizeof(info));
@@ -458,7 +543,11 @@ void appendModuleRecord(char *out, size_t capacity, const char *tag,
         appendLiteral(out, capacity, &length, " lib=<unresolved> pc_is_unmapped=1");
     }
     appendLiteral(out, capacity, &length, "\n");
-    out[capacity - 1] = '\0';
+    // Terminate at the append length, not at capacity-1. commitRecord() measures
+    // with strlen(), and terminating at the far end made every record carry the
+    // previous call's leftover stack bytes -- an on-device run produced repeated
+    // signal= lines and a truncated tail that way.
+    out[length < capacity ? length : capacity - 1] = '\0';
 }
 
 void appendRawFrameRecord(char *out, size_t capacity, const char *tag,
@@ -468,7 +557,7 @@ void appendRawFrameRecord(char *out, size_t capacity, const char *tag,
     appendLiteral(out, capacity, &length, " pc=0x");
     appendHex(out, capacity, &length, pc);
     appendLiteral(out, capacity, &length, "\n");
-    out[capacity - 1] = '\0';
+    out[length < capacity ? length : capacity - 1] = '\0';
 }
 
 void commitRecord(const char *record) {
