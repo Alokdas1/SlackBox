@@ -373,16 +373,47 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
         try {
             String sharedCrashLogDirectory = resolveSharedCrashLogDirectory();
+            String downloadCrashLogDirectory = resolveDownloadCrashLogDirectory();
             NativeCore.installNativeCrashHandler(crashLogDirectory.getAbsolutePath(),
-                    sharedCrashLogDirectory);
+                    sharedCrashLogDirectory, downloadCrashLogDirectory);
             // Breadcrumb so the guest timeline shows whether the handler was armed
             // before a death -- otherwise "no native_crash file" is ambiguous.
             CrashMonitor.recordEvent("native_crash_handler_armed", packageName, processName,
                     getUserId(), "", crashLogDirectory.getAbsolutePath()
-                            + " shared=" + sharedCrashLogDirectory);
+                            + " shared=" + sharedCrashLogDirectory
+                            + " download=" + downloadCrashLogDirectory);
         } catch (Throwable ignored) {
             Slog.w(TAG, "Native crash diagnostics unavailable");
         }
+    }
+
+    /**
+     * The only sink a human can actually open. Android 30+ scoped storage makes
+     * Android/data/&lt;pkg&gt;/ opaque to every file manager and to Termux, so a log
+     * that only lands in getExternalFilesDir cannot be read without root -- the
+     * user reported exactly this when a file manager refused to open
+     * native_crash_*.log under Android/data/top.niunaijun.blackbox/files/.
+     *
+     * Download/logs is the one location that is both writable by the app and
+     * readable from Termux, so it gets a dedicated sink alongside the others.
+     *
+     * Requires MANAGE_EXTERNAL_STORAGE. Declaring the permission is not enough --
+     * the device logcat showed "MANAGE_EXTERNAL_STORAGE permission not granted",
+     * so until the user enables All files access in Settings this returns a path
+     * that cannot be opened for writing. The native arm probe echoes the resolved
+     * path, so a silent no-op shows up as a missing download= line in the log
+     * rather than as a mysteriously empty crash file.
+     */
+    private static String resolveDownloadCrashLogDirectory() {
+        try {
+            File logs = new File(Environment.getExternalStorageDirectory(), "Download/logs");
+            if (logs.isDirectory() || logs.mkdirs()) {
+                return logs.getAbsolutePath();
+            }
+        } catch (Throwable ignored) {
+            // Fall through: the other two sinks still work.
+        }
+        return null;
     }
 
     /**

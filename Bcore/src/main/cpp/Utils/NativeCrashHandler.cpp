@@ -6,8 +6,10 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #include <ucontext.h>
@@ -35,10 +37,33 @@ const int kHandledCount = (int) (sizeof(kHandledSignals) / sizeof(kHandledSignal
 struct sigaction g_previous[kHandledCount];
 char g_internalPath[256];
 char g_sharedPath[256];
+char g_downloadPath[256];
 char g_alternateStack[64 * 1024];
 volatile sig_atomic_t g_internalReady = 0;
 volatile sig_atomic_t g_sharedReady = 0;
+volatile sig_atomic_t g_downloadReady = 0;
 volatile sig_atomic_t g_reentered = 0;
+
+// Single writer at a time. The re-arm thread and the crashing thread can both
+// append, and without this the records interleave: an on-device run produced
+// binary garbage spliced between native_crash_displaced lines. A test-and-set
+// spin is used rather than a pthread mutex because mutexes are not
+// async-signal-safe. It gives up rather than blocking, because losing a record
+// to a stuck writer is worse than losing one line to a torn write.
+volatile sig_atomic_t g_writeLock = 0;
+
+static bool acquireWriteLock() {
+    for (int spin = 0; spin < 4096; spin++) {
+        if (__sync_lock_test_and_set(&g_writeLock, 1) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void releaseWriteLock() {
+    __sync_lock_release(&g_writeLock);
+}
 
 void appendLiteral(char *out, size_t capacity, size_t *length, const char *text) {
     while (*text != '\0' && *length + 1 < capacity) {
@@ -99,7 +124,7 @@ void buildCrashPath(char *out, size_t capacity, const char *directory) {
 // Raw syscalls on purpose -- see the file header. Never touches libc wrappers.
 void appendRecordToFile(const char *path, volatile sig_atomic_t *ready,
                         const char *line, size_t length) {
-    if (*ready == 0) {
+    if (*ready == 0 || path[0] == '\0') {
         return;
     }
     long fd = syscall(__NR_openat, AT_FDCWD, path, O_CREAT | O_WRONLY | O_APPEND, 0600);
@@ -107,6 +132,24 @@ void appendRecordToFile(const char *path, volatile sig_atomic_t *ready,
         syscall(__NR_write, fd, line, length);
         syscall(__NR_close, fd);
     }
+}
+
+// Every record goes to all three sinks under the write lock. The Download
+// sink is the one the user can actually open without root: Android 30+ scoped
+// storage makes Android/data/<pkg>/ opaque to Termux and to every file
+// manager, so a log that only lands there is a log nobody can read.
+void writeRecordToAllSinks(const char *line, size_t length) {
+    if (!acquireWriteLock()) {
+        // Fall through unlocked rather than dropping the record entirely.
+        appendRecordToFile(g_internalPath, &g_internalReady, line, length);
+        appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+        appendRecordToFile(g_downloadPath, &g_downloadReady, line, length);
+        return;
+    }
+    appendRecordToFile(g_internalPath, &g_internalReady, line, length);
+    appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+    appendRecordToFile(g_downloadPath, &g_downloadReady, line, length);
+    releaseWriteLock();
 }
 
 // The guest may have its own crash reporter (Tencent's CrashSight, UE4 itself).
@@ -144,6 +187,8 @@ void appendRawFrameRecord(char *out, size_t capacity, const char *tag, uintptr_t
 void appendModuleRecord(char *out, size_t capacity, const char *tag, uintptr_t pc);
 void commitRecord(const char *record);
 void dumpProcMaps();
+static void noteForeignHandler(int index, const struct sigaction *act);
+static void installOurHandler(int signum);
 
 void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
     if (g_reentered) {
@@ -180,8 +225,7 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
 // Commit the async-signal-safe essentials before consulting the dynamic
     // linker. dladdr() is not async-signal-safe; if it faults while the loader
     // lock is held, a re-entry would otherwise _exit before writing any report.
-    appendRecordToFile(g_internalPath, &g_internalReady, line, length);
-    appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+    writeRecordToAllSinks(line, length);
 
     // Raw program counters first, still without the loader lock. On SIGBUS and
     // SIGSEGV the fault address in si_addr is the single most useful field and
@@ -214,8 +258,7 @@ void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
                       (uintptr_t) programCounter - (uintptr_t) symbol.dli_fbase);
             appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "\n");
             moduleLine[moduleLength < sizeof(moduleLength) ? moduleLength : sizeof(moduleLength) - 1] = '\0';
-            appendRecordToFile(g_internalPath, &g_internalReady, moduleLine, moduleLength);
-            appendRecordToFile(g_sharedPath, &g_sharedReady, moduleLine, moduleLength);
+            writeRecordToAllSinks(moduleLine, moduleLength);
             __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", moduleLine);
         }
     }
@@ -247,9 +290,10 @@ void writeArmProbe() {
     appendLiteral(line, sizeof(line), &length, g_internalPath);
     appendLiteral(line, sizeof(line), &length, " shared=");
     appendLiteral(line, sizeof(line), &length, g_sharedPath);
+    appendLiteral(line, sizeof(line), &length, " download=");
+    appendLiteral(line, sizeof(line), &length, g_downloadPath[0] != '\0' ? g_downloadPath : "<none>");
     appendLiteral(line, sizeof(line), &length, "\n");
-    appendRecordToFile(g_internalPath, &g_internalReady, line, length);
-    appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+    writeRecordToAllSinks(line, length);
 }
 
 // Resolving one libc symbol through xdl, the same pattern VirtualSpoof uses.
@@ -307,44 +351,21 @@ static bool ourHandlerIsInstalled(int signalNumber) {
     return current.sa_sigaction == handleSignal;
 }
 
+// Backstop only. The sigaction hook below keeps us outermost for anything that
+// goes through the public entry point; this catches installers that reach past
+// it (__sigaction, or a raw rt_sigaction), and re-installs without re-logging an
+// owner we have already recorded.
 static void ensureHandlersArmed() {
     for (int i = 0; i < kHandledCount; i++) {
         if (ourHandlerIsInstalled(kHandledSignals[i])) {
             continue;
         }
-        // Somebody replaced us. Record who before taking it back, so a crash that
-        // still bypasses this handler can be traced to the library that owns the
-        // disposition at that moment instead of being guessed at.
         struct sigaction current;
         memset(&current, 0, sizeof(current));
-        if (sigaction(kHandledSignals[i], nullptr, &current) == 0 &&
-            current.sa_sigaction != handleSignal) {
-            char stolenLine[512];
-            appendModuleRecord(stolenLine, sizeof(stolenLine), "native_crash_displaced",
-                               (uintptr_t) current.sa_sigaction);
-            size_t len = strlen(stolenLine);
-            while (len > 0 && stolenLine[len - 1] != '\n') {
-                stolenLine[--len] = '\0';
-            }
-            size_t used = len;
-            appendLiteral(stolenLine, sizeof(stolenLine), &used, " signal=");
-            appendLiteral(stolenLine, sizeof(stolenLine), &used, signalName(kHandledSignals[i]));
-            appendLiteral(stolenLine, sizeof(stolenLine), &used, "\n");
-            commitRecord(stolenLine);
+        if (sigaction(kHandledSignals[i], nullptr, &current) == 0) {
+            noteForeignHandler(i, &current);
         }
-        struct sigaction action;
-        memset(&action, 0, sizeof(action));
-        action.sa_sigaction = handleSignal;
-        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-        sigemptyset(&action.sa_mask);
-        struct sigaction existing;
-        memset(&existing, 0, sizeof(existing));
-        if (sigaction(kHandledSignals[i], &action, &existing) != 0) {
-            continue;
-        }
-        if (existing.sa_sigaction != handleSignal) {
-            g_previous[i] = existing;
-        }
+        installOurHandler(kHandledSignals[i]);
     }
 }
 
@@ -452,8 +473,7 @@ void appendRawFrameRecord(char *out, size_t capacity, const char *tag,
 
 void commitRecord(const char *record) {
     size_t length = strlen(record);
-    appendRecordToFile(g_internalPath, &g_internalReady, record, length);
-    appendRecordToFile(g_sharedPath, &g_sharedReady, record, length);
+    writeRecordToAllSinks(record, length);
     __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", record);
 }
 
@@ -464,35 +484,42 @@ void dumpProcMaps() {
     if (fd < 0) {
         return;
     }
-    char mapPath[256];
-    size_t pathLength = 0;
-    appendLiteral(mapPath, sizeof(mapPath), &pathLength, g_sharedPath);
-    // native_crash_1234.log -> native_maps_1234.log
-    const char *lastSlash = strrchr(mapPath, '/');
-    if (lastSlash != nullptr) {
-        pathLength = (size_t) (lastSlash - mapPath) + 1;
-    } else {
-        pathLength = 0;
-    }
-    appendLiteral(mapPath, sizeof(mapPath), &pathLength, "native_maps_");
-    appendSigned(mapPath, sizeof(mapPath), &pathLength, (long) getpid());
-    appendLiteral(mapPath, sizeof(mapPath), &pathLength, ".log\n");
-
-    long out = syscall(__NR_openat, AT_FDCWD, mapPath,
-                       O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    if (out < 0) {
-        syscall(__NR_close, fd);
-        return;
-    }
     char buffer[4096];
-    for (;;) {
-        long got = syscall(__NR_read, fd, buffer, sizeof(buffer));
-        if (got <= 0) {
-            break;
+    const char *sinks[3];
+    sinks[0] = g_internalReady ? g_internalPath : nullptr;
+    sinks[1] = g_sharedReady ? g_sharedPath : nullptr;
+    sinks[2] = g_downloadReady ? g_downloadPath : nullptr;
+
+    for (int s = 0; s < 3; s++) {
+        if (sinks[s] == nullptr) {
+            continue;
         }
-        syscall(__NR_write, out, buffer, (size_t) got);
+        char mapPath[256];
+        size_t pathLength = 0;
+        appendLiteral(mapPath, sizeof(mapPath), &pathLength, sinks[s]);
+        // native_crash_1234.log -> native_maps_1234.log
+        const char *lastSlash = strrchr(mapPath, '/');
+        pathLength = lastSlash != nullptr ? (size_t) (lastSlash - mapPath) + 1 : 0;
+        appendLiteral(mapPath, sizeof(mapPath), &pathLength, "native_maps_");
+        appendSigned(mapPath, sizeof(mapPath), &pathLength, (long) getpid());
+        appendLiteral(mapPath, sizeof(mapPath), &pathLength, ".log\n");
+
+        long out = syscall(__NR_openat, AT_FDCWD, mapPath,
+                           O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (out < 0) {
+            continue;
+        }
+        // Rewind: /proc/self/maps is a seq_file, one read pass only.
+        syscall(__NR_lseek, fd, 0, SEEK_SET, nullptr);
+        for (;;) {
+            long got = syscall(__NR_read, fd, buffer, sizeof(buffer));
+            if (got <= 0) {
+                break;
+            }
+            syscall(__NR_write, out, buffer, (size_t) got);
+        }
+        syscall(__NR_close, out);
     }
-    syscall(__NR_close, out);
     syscall(__NR_close, fd);
 }
 
@@ -559,6 +586,106 @@ static void installAbortHook() {
     }
 }
 
+// --- sigaction() interception ------------------------------------------------
+//
+// Measured on com.proxima.dfm (pid 27316): the guest's own crash reporters
+// displaced our fatal-signal handlers twelve times in a single run, alternating
+// between libCrashSight.so+0x1c2e8 (Tencent) and libcrashlytics-common.so
+// +0x9d7c0 (Google). Our one-second re-arm took the disposition back, they took
+// it again, and the crash landed in whichever window they happened to hold --
+// so the crash file held the arm line and nothing else. A timer cannot win that.
+//
+// Rather than fight for the disposition, wrap it. The installer still gets what
+// it asked for and still believes it owns the signal; we remember their handler
+// and put ours back on top. handleSignal() writes the record and then chains to
+// them, so their reporter behaves exactly as before. Nothing about the guest
+// changes -- we only observe before it runs.
+
+static int (*orig_sigaction)(int, const struct sigaction *, struct sigaction *) = nullptr;
+
+static int indexOfSignal(int signum) {
+    for (int i = 0; i < kHandledCount; i++) {
+        if (kHandledSignals[i] == signum) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Deduplicates: both the sigaction hook and the re-arm backstop funnel through
+// here, and without this the file filled with repeats of the same owner.
+static void noteForeignHandler(int index, const struct sigaction *act) {
+    if (index < 0 || act == nullptr) {
+        return;
+    }
+    if (g_previous[index].sa_sigaction == act->sa_sigaction) {
+        return;
+    }
+    g_previous[index] = *act;
+
+    char line[512];
+    appendModuleRecord(line, sizeof(line), "native_crash_displaced",
+                       (uintptr_t) act->sa_sigaction);
+    size_t length = strlen(line);
+    while (length > 0 && line[length - 1] != '\n') {
+        line[--length] = '\0';
+    }
+    size_t used = length;
+    appendLiteral(line, sizeof(line), &used, " signal=");
+    appendLiteral(line, sizeof(line), &used, signalName(kHandledSignals[index]));
+    appendLiteral(line, sizeof(line), &used, " disposition=wrapped_owned_by_us=1\n");
+    line[used < sizeof(line) ? used : sizeof(line) - 1] = '\0';
+    commitRecord(line);
+}
+
+static void installOurHandler(int signum) {
+    if (orig_sigaction == nullptr) {
+        return;
+    }
+    struct sigaction ours;
+    memset(&ours, 0, sizeof(ours));
+    ours.sa_sigaction = handleSignal;
+    ours.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&ours.sa_mask);
+    orig_sigaction(signum, &ours, nullptr);
+}
+
+static int my_sigaction(int signum, const struct sigaction *act,
+                        struct sigaction *oldact) {
+    if (orig_sigaction == nullptr) {
+        if (oldact != nullptr) {
+            memset(oldact, 0, sizeof(*oldact));
+        }
+        return -1;
+    }
+    // Forward first, so *oldact holds what the caller would have seen.
+    int result = orig_sigaction(signum, act, oldact);
+    if (result != 0 || act == nullptr) {
+        return result;
+    }
+    int index = indexOfSignal(signum);
+    if (index < 0) {
+        return result;
+    }
+    if ((act->sa_flags & SA_SIGINFO) == 0) {
+        return result; // not a SA_SIGINFO handler; nothing to wrap
+    }
+    if (act->sa_sigaction == handleSignal) {
+        return result; // our own re-install
+    }
+    noteForeignHandler(index, act);
+    installOurHandler(signum);
+    return result;
+}
+
+static void installSigactionHook() {
+    void *target = resolve_libc("sigaction");
+    if (target == nullptr) {
+        return;
+    }
+    DobbyHook(target, (void *) my_sigaction, (void **) &orig_sigaction);
+}
+
 // A game engine and its crash reporter install their own fatal-signal handlers
 // well after the guest binds, silently replacing ours. This thread notices and
 // re-arms, but only for the signals whose disposition actually drifted.
@@ -574,7 +701,8 @@ void *rearmLoop(void *) {
 }
 } // namespace
 
-void NativeCrashHandler::install(const char *internalDirectory, const char *sharedDirectory) {
+void NativeCrashHandler::install(const char *internalDirectory, const char *sharedDirectory,
+                                 const char *downloadDirectory) {
     if (internalDirectory != nullptr) {
         buildCrashPath(g_internalPath, sizeof(g_internalPath), internalDirectory);
         g_internalReady = 1;
@@ -582,6 +710,10 @@ void NativeCrashHandler::install(const char *internalDirectory, const char *shar
     if (sharedDirectory != nullptr) {
         buildCrashPath(g_sharedPath, sizeof(g_sharedPath), sharedDirectory);
         g_sharedReady = 1;
+    }
+    if (downloadDirectory != nullptr) {
+        buildCrashPath(g_downloadPath, sizeof(g_downloadPath), downloadDirectory);
+        g_downloadReady = 1;
     }
 
     stack_t alternate; // run the handler off a dedicated stack (stack-overflow SIGSEGV)
@@ -593,6 +725,9 @@ void NativeCrashHandler::install(const char *internalDirectory, const char *shar
 
     writeArmProbe();
     armHandlers();
+    // Order matters: sigaction is wrapped before abort so a reporter that
+    // installs handlers during its own init is already captured.
+    installSigactionHook();
     installAbortHook();
 
     pthread_t watchdog;
