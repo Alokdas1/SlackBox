@@ -416,6 +416,11 @@ public class CrashMonitor {
                             + " process=" + processName
                             + " (scanned " + reasons.size() + " recent exits)";
                 }
+                // Pull the platform's own crash trace before summarising. This is
+                // the same text that reaches the tombstone and logcat's DEBUG
+                // buffer, handed to us through a documented API, so it costs
+                // nothing in signal handling.
+                String tracePath = persistExitTrace(match, pid);
                 CharSequence description = match.getDescription();
                 return "reason=" + reasonName(match.getReason())
                         + "; status=" + match.getStatus()
@@ -423,10 +428,73 @@ public class CrashMonitor {
                         + "; pss=" + match.getPss() + "kB"
                         + "; rss=" + match.getRss() + "kB"
                         + "; at=" + match.getTimestamp()
+                        + "; trace=" + tracePath
                         + "; description=" + (description == null ? "" : description);
             } catch (Throwable t) {
                 return "cause=unknown; exit-reason query failed: " + t;
             }
+        }
+
+        /**
+         * Writes ApplicationExitInfo.getTraceInputStream() into crash_logs so the
+         * guest diagnostics dump carries a real native backtrace.
+         *
+         * Why this exists: the in-process native handler cannot see this death.
+         * NativeCrashHandler installs with kWrapSigaction = false, deliberately,
+         * because taking the fatal signals from the game's own reporter stopped
+         * the guest rendering at all. So for a native death the game keeps the
+         * disposition, our handler never runs, and native_crash_<pid>.log
+         * contains only the arm line. The platform, however, already captured
+         * the trace before signalling, and getTraceInputStream() is the supported
+         * way to read it back. Reading it here is a plain Binder call on the
+         * binder-death path -- no signal handling, no disposition changes, and no
+         * chance of the failure mode the wrap produced.
+         *
+         * Returns the absolute path written, or a short reason it could not be
+         * written, so the summary line is self-describing either way.
+         */
+        private static String persistExitTrace(android.app.ApplicationExitInfo info, int pid) {
+            java.io.InputStream source;
+            try {
+                source = info.getTraceInputStream();
+            } catch (Throwable t) {
+                return "<getTraceInputStream failed: " + t + ">";
+            }
+            if (source == null) {
+                // Normal for REASON_EXIT_SELF and for a low-memory kill: there is
+                // no trace to read. Not an error worth logging.
+                return "<none>";
+            }
+            Context context = BlackBoxCore.getContext();
+            if (context == null) {
+                return "<no host context>";
+            }
+            File directory = new File(context.getFilesDir(), "crash_logs");
+            if (!directory.exists() && !directory.mkdirs() && !directory.isDirectory()) {
+                return "<cannot create " + directory.getAbsolutePath() + ">";
+            }
+            String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS").format(new Date());
+            File target = new File(directory, "exit_trace_" + pid + "_" + stamp + ".txt");
+            long written = 0;
+            // Bounded: a runaway trace must not fill the device. 256 KB covers a
+            // deep native backtrace with symbols.
+            final long kMaxBytes = 256L * 1024L;
+            try (java.io.InputStream input = source;
+                 java.io.OutputStream output = new FileOutputStream(target)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while (written < kMaxBytes && (read = input.read(buffer)) > 0) {
+                    long allowance = kMaxBytes - written;
+                    int toWrite = (int) Math.min(read, allowance);
+                    output.write(buffer, 0, toWrite);
+                    written += toWrite;
+                }
+            } catch (Throwable t) {
+                return "<write failed after " + written + "B: " + t + ">";
+            }
+            Slog.i(TAG, "exit trace for pid " + pid + " (" + written + "B) -> "
+                    + target.getAbsolutePath());
+            return target.getName() + " (" + written + "B)";
         }
 
         /**
