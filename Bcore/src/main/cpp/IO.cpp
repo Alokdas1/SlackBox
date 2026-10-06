@@ -34,38 +34,47 @@ char *replace(const char *str, const char *src, const char *dst) {
     return result;
 }
 
-const char *IO::redirectPath(const char *__path) {
-    
+// Core implementation. `owned` is set at each return site rather than inferred
+// by comparing pointers afterwards: this function returns the caller's pointer,
+// a heap buffer from replace(), or the literal "/dev/null", and only the middle
+// case may be freed. Inferring ownership from `result != path` frees the
+// literal and crashes, so the ownership decision stays here where each branch is
+// visible.
+static const char *redirectPathImpl(const char *__path, bool *owned) {
+    if (owned != nullptr) {
+        *owned = false;
+    }
+
     if (strstr(__path, "resource-cache")) {
         ALOGD("Blocking resource-cache path: %s", __path);
         return "/dev/null";
     }
-    
-    
+
+
     if (strstr(__path, "@idmap")) {
         ALOGD("Blocking idmap path: %s", __path);
         return "/dev/null";
     }
-    
-    
+
+
     if (strstr(__path, "systemui") && (strstr(__path, ".frro") || strstr(__path, "-accent-") || strstr(__path, "-dynamic-") || strstr(__path, "-neutral-"))) {
         ALOGD("Blocking systemui problematic path: %s", __path);
         return "/dev/null";
     }
-    
-    
+
+
     if (strstr(__path, "data@resource-cache@")) {
         ALOGD("Blocking data@resource-cache@ pattern: %s", __path);
         return "/dev/null";
     }
-    
-    
+
+
     if (strstr(__path, ".frro")) {
         ALOGD("Blocking .frro file: %s", __path);
         return "/dev/null";
     }
-    
-    
+
+
     if (strstr(__path, "systemui")) {
         ALOGD("Blocking systemui path: %s", __path);
         return "/dev/null";
@@ -76,11 +85,30 @@ const char *IO::redirectPath(const char *__path) {
         IO::RelocateInfo info = *iterator;
         if (strstr(__path, info.targetPath) && !strstr(__path, "/blackbox/")) {
             char *ret = replace(__path, info.targetPath, info.relocatePath);
-            
+            if (owned != nullptr) {
+                *owned = true;
+            }
             return ret;
         }
     }
     return __path;
+}
+
+const char *IO::redirectPath(const char *__path, bool *owned) {
+    if (__path == nullptr) {
+        if (owned != nullptr) {
+            *owned = false;
+        }
+        return nullptr;
+    }
+    return redirectPathImpl(__path, owned);
+}
+
+const char *IO::redirectPath(const char *__path) {
+    if (__path == nullptr) {
+        return nullptr;
+    }
+    return redirectPathImpl(__path, nullptr);
 }
 
 jstring IO::redirectPath(JNIEnv *env, jstring path) {
