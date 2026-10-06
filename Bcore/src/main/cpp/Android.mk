@@ -28,21 +28,16 @@ SRC3 := $(wildcard $(LOCAL_PATH)/Hook/*.cpp) $(wildcard $(LOCAL_PATH)/Hook/*.c)
 # Collect all source files in JniHook/
 SRC4 := $(wildcard $(LOCAL_PATH)/JniHook/*.cpp) $(wildcard $(LOCAL_PATH)/JniHook/*.c)
 
-# The module name becomes the on-disk .so filename, and a guest can read it out
-# of /proc/self/maps. "blackbox" names the virtualization framework outright, so
-# it is loaded under a name that reads like an ordinary support library.
-LOCAL_MODULE := stealth_runtime
+LOCAL_MODULE := blackbox
 LOCAL_SRC_FILES := BoxCore.cpp \
 hidden_api.cpp \
 IO.cpp \
 Utils/elf_util.cpp \
 Hook/DexFileHook.cpp \
 Hook/FileSystemHook.cpp \
-Hook/RuntimeHook.cpp \
 Utils/HexDump.cpp \
 Utils/NativeCrashHandler.cpp \
-Utils/StealthPaths.cpp \
-Utils/VirtualSpoof.cpp \
+Utils/AntiDetection.cpp \
 Hook/VMClassLoaderHook.cpp \
 Hook/UnixFileSystemHook.cpp \
 Hook/BinderHook.cpp \

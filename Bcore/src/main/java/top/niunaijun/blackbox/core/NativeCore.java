@@ -23,10 +23,7 @@ public class NativeCore {
 
     static {
 
-        // The argument must match LOCAL_MODULE in Bcore/src/main/cpp/Android.mk.
-        // The name is chosen so the resulting entry in /proc/self/maps does not
-        // advertise a container.
-        System.loadLibrary("stealth_runtime");
+        System.loadLibrary("blackbox");
     }
 
     public static native void init(int apiLevel);

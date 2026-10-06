@@ -15,7 +15,6 @@
 #include <Hook/RuntimeHook.h>
 #include "Utils/HexDump.h"
 #include "Utils/NativeCrashHandler.h"
-#include "Utils/VirtualSpoof.h"
 #include "hidden_api.h"
 
 struct {
@@ -75,21 +74,11 @@ JavaVM *BoxCore::getJavaVM() {
 void nativeHook(JNIEnv *env) {
     BaseHook::init(env);
     UnixFileSystemHook::init(env);
+    FileSystemHook::init();
     VMClassLoaderHook::init(env);
 
     BinderHook::init(env);
     DexFileHook::init(env);
-    RuntimeHook::init(env);
-
-    // Property interception runs before the libc filesystem hooks on purpose.
-    // install_property_hooks() patches __system_property_find/read, and those
-    // live in libc; the filesystem hooks rewrite the same library's PLT/GOT
-    // entries. Running the property hooks first means a read that the
-    // filesystem layer might have redirected is already resolved, and neither
-    // layer invalidates the other's trampolines because Dobby allocates each
-    // trampoline in the hooked function's own page.
-    install_property_hooks();
-    FileSystemHook::init();
 }
 
 void hideXposed(JNIEnv *env, jclass clazz) {
