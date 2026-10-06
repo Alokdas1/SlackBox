@@ -10,8 +10,10 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ProviderInfo;
 import android.content.pm.ResolveInfo;
+import android.os.Binder;
 import android.os.IBinder;
 import android.os.IInterface;
+import android.os.Process;
 import android.util.Log;
 
 import java.lang.ref.WeakReference;
@@ -760,6 +762,20 @@ public class IActivityManagerProxy extends ClassInvocationStub {
     public static class getHistoricalProcessExitReasons extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            // Guest isolation: a guest proxy process must not be able to enumerate
+            // the host's exit history. Only Binder-originated calls need blanking,
+            // because a guest (host:pN) cannot reach this code any other way --
+            // every in-process reference here lives inside our own server process.
+            //
+            // The same-uid passthrough exists because our own crash diagnostics
+            // call this API from inside the server process (BProcessManagerService
+            // -> CrashMonitor.describeProcessExit), and that server process has
+            // this hook installed. Blanking unconditionally made the guest death
+            // cause permanently unreadable, so we were debugging the hook by
+            // running into the hook.
+            if (Binder.getCallingUid() == Process.myUid()) {
+                return method.invoke(who, args);
+            }
             return ParceledListSliceCompat.create(new ArrayList<>());
         }
     }
