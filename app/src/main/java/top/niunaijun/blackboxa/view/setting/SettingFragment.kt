@@ -172,18 +172,37 @@ class SettingFragment : PreferenceFragmentCompat() {
      */
     private fun buildGuestDiagnosticsReport(): String {
         val crashDirectory = File(requireContext().filesDir, "crash_logs")
-        val sharedDirectory = File(Environment.getExternalStorageDirectory(), "Download/logs")
+        val externalCrash = requireContext().getExternalFilesDir("crash_logs")
+        val legacyShared = File(Environment.getExternalStorageDirectory(), "Download/logs")
         val timelineFile = File(crashDirectory, "guest_events.jsonl")
         val timeline = if (timelineFile.isFile) readTail(timelineFile, 64 * 1024) else ""
 
-        val nativeReports = collectDiagnosticFiles(crashDirectory, sharedDirectory,
-                "native_crash_", ".log")
-        val javaReports = collectDiagnosticFiles(crashDirectory, null, "crash_", ".log")
+        // Three roots, because the shared mirror moved. Before this change the
+        // native handler wrote to Download/logs, which needs
+        // MANAGE_EXTERNAL_STORAGE and silently failed when it was not granted
+        // (the device logcat shows exactly that). It now prefers
+        // getExternalFilesDir("crash_logs"), so an older crash file may still be
+        // sitting in Download/logs and a newer one in external files. Collect
+        // from all three and keep the newest copy of each name.
+        val roots = listOf(
+                crashDirectory to "internal",
+                externalCrash to "external",
+                legacyShared to "legacy-shared")
+        val nativeReports = collectDiagnosticFiles(roots, "native_crash_", ".log")
+        val javaReports = collectDiagnosticFiles(roots, "crash_", ".log")
 
         val output = StringBuilder()
         output.append("=== Guest diagnostics ===\n")
-        if (!crashDirectory.isDirectory) {
-            output.append("Crash directory missing: ").append(crashDirectory.absolutePath).append('\n')
+        output.append("Search roots:\n")
+        for ((directory, label) in roots) {
+            val path = directory?.absolutePath ?: "(unavailable)"
+            val state = when {
+                directory == null -> "unavailable"
+                directory.isDirectory -> "ok"
+                else -> "MISSING"
+            }
+            output.append("  [").append(state).append("] ").append(label)
+                    .append(": ").append(path).append('\n')
         }
         output.append(summarizeTimeline(timeline))
         output.append(artifactList("Native crash reports", nativeReports))
@@ -194,7 +213,45 @@ class SettingFragment : PreferenceFragmentCompat() {
 
         appendReportBodies(output, "Native", nativeReports, 3, 24 * 1024)
         appendReportBodies(output, "Java", javaReports, 3, 16 * 1024)
+
+        output.append("\n=== logcat -d (last lines, in-process) ===\n")
+        output.append(captureLogcatDump(4000))
         return output.toString()
+    }
+
+    /**
+     * In-process logcat slice, appended to the report so the crash moment is
+     * visible without a separate adb capture.
+     *
+     * The external capture script only covered the first ~2s of a 51s run on the
+     * device this was written for, so it missed the abort entirely. This reads the
+     * ring buffer that is already in memory at the moment the user opens the
+     * dialog, which is after the death.
+     *
+     * "logcat -d" with a negative tail is not supported by every build, so the
+     * line count is passed with -t and the result is trimmed here instead.
+     */
+    private fun captureLogcatDump(maxLines: Int): String {
+        return try {
+            val process = Runtime.getRuntime().exec(
+                    arrayOf("logcat", "-d", "-v", "threadtime", "-t", maxLines.toString()))
+            process.errorStream.close()
+            val text = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            process.destroy()
+            val keys = listOf(
+                    "fatal", "androidruntime", "sigsegv", "sigabrt", "sigbus",
+                    "tombstone", "backtrace", "crash_dump", "abort",
+                    "naijun", "blackbox", "slackbox", "nativecore",
+                    "guest_process", "libc", "DEBUG")
+            val filtered = text.lineSequence().filter { line ->
+                val lower = line.lowercase()
+                keys.any { lower.contains(it) }
+            }.joinToString("\n")
+            if (filtered.isBlank()) text.takeLast(12_000) else filtered
+        } catch (t: Throwable) {
+            "logcat dump failed: ${t.javaClass.simpleName}: ${t.message}"
+        }
     }
 
     // Flat JSON lines: pull one quoted field without dragging in a JSON parser.
@@ -261,19 +318,23 @@ class SettingFragment : PreferenceFragmentCompat() {
         else -> "signal"
     }
 
-    private fun collectDiagnosticFiles(primary: File?, secondary: File?,
+    /**
+     * Collect prefix*suffix files across every supplied root, keeping the newest
+     * copy of any given filename. Roots are (directory, label) pairs so the report
+     * can say which one a file actually came from.
+     */
+    private fun collectDiagnosticFiles(roots: List<Pair<File?, String>>,
                                        prefix: String, suffix: String): List<Pair<File, String>> {
         val found = LinkedHashMap<String, Pair<File, String>>()
-        for (candidate in listOf(primary to "internal", secondary to "shared")) {
-            val directory = candidate.first ?: continue
-            if (!directory.isDirectory) continue
+        for ((directory, label) in roots) {
+            if (directory == null || !directory.isDirectory) continue
             val matches = directory.listFiles { file ->
                 file.isFile && file.name.startsWith(prefix) && file.name.endsWith(suffix)
             }.orEmpty()
             for (match in matches) {
                 val existing = found[match.name]
                 if (existing == null || match.lastModified() > existing.first.lastModified()) {
-                    found[match.name] = match to candidate.second
+                    found[match.name] = match to label
                 }
             }
         }

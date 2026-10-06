@@ -387,21 +387,36 @@ public class BActivityThread extends IBActivityThread.Stub {
 
     /**
      * The internal crash directory sits under the host app's private data, which an
-     * external collector cannot read. The shared one lands in a public folder. The
-     * native side opens it with raw syscalls so the guest's own IO redirect cannot
-     * reroute the crash record back into the sandbox.
+     * external collector cannot read. The shared one must be readable by whatever
+     * pulls the logs off the device.
+     *
+     * getExternalFilesDir("crash_logs") is preferred over Download/logs. On API 30+
+     * Download/logs is only writable when MANAGE_EXTERNAL_STORAGE is granted, and
+     * the device logcat shows it frequently is not ("MANAGE_EXTERNAL_STORAGE
+     * permission not granted"), so the legacy path silently failed and the shared
+     * mirror was lost. getExternalFilesDir needs no permission at all and survives
+     * the targetSdk 36 scoped-storage enforcement.
+     *
+     * The native side opens this path with raw syscalls so the guest's own IO
+     * redirect cannot reroute the crash record back into the sandbox.
      */
     private static String resolveSharedCrashLogDirectory() {
         try {
-            File sharedCrashLogDirectory = new File(
-                    Environment.getExternalStorageDirectory(), "Download/logs");
-            if (!sharedCrashLogDirectory.isDirectory() && !sharedCrashLogDirectory.mkdirs()) {
-                return null;
+            Context ctx = BlackBoxCore.getContext();
+            if (ctx != null) {
+                File external = ctx.getExternalFilesDir("crash_logs");
+                if (external != null && (external.isDirectory() || external.mkdirs())) {
+                    return external.getAbsolutePath();
+                }
             }
-            return sharedCrashLogDirectory.getAbsolutePath();
+            File legacy = new File(Environment.getExternalStorageDirectory(), "Download/logs");
+            if (legacy.isDirectory() || legacy.mkdirs()) {
+                return legacy.getAbsolutePath();
+            }
         } catch (Throwable ignored) {
             return null;
         }
+        return null;
     }
 
     public synchronized void handleBindApplication(String packageName, String processName) {

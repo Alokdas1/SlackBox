@@ -12,6 +12,9 @@
 #include <unistd.h>
 #include <ucontext.h>
 
+#include "Dobby/dobby.h"
+#include "xdl.h"
+
 // A guest death that arrives as a Binder death carries no reason. The platform
 // exit reason says SIGNALED and hands back the signal number, but not the
 // address or the library that faulted, so a native crash is unattributable.
@@ -216,6 +219,18 @@ void writeArmProbe() {
     appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
 }
 
+// Resolving one libc symbol through xdl, the same pattern VirtualSpoof uses.
+// Kept as a helper because the abort hook below needs it too.
+static void *resolve_libc(const char *symbol) {
+    void *handle = xdl_open("libc.so", XDL_DEFAULT);
+    if (!handle) {
+        return nullptr;
+    }
+    void *target = xdl_dsym(handle, symbol, nullptr);
+    xdl_close(handle);
+    return target;
+}
+
 void armHandlers() {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
@@ -236,16 +251,148 @@ void armHandlers() {
     }
 }
 
+// Re-arm only when the disposition is no longer ours.
+//
+// The previous version re-armed unconditionally every 500ms. That is a fight
+// neither side wins: the engine installs its reporter, our timer overwrites it,
+// the engine reinstalls, and whichever call lands last owns SIGABRT when the
+// process dies. Measured on com.proxima.dfm: the arm probe wrote at t+0.1s, the
+// guest died by abort() at t+51.5s, and the crash file contained the arm line
+// and nothing else -- our handler never ran, because the engine's reporter
+// owned the disposition at that moment.
+//
+// Comparing before writing costs six sigaction calls only when something
+// actually changed, and lets the engine's handler stand until it needs to be
+// replaced. SIGABRT is additionally caught at the abort() call site below, so a
+// self-abort is recorded regardless of who owns the signal disposition.
+static bool ourHandlerIsInstalled(int signalNumber) {
+    struct sigaction current;
+    memset(&current, 0, sizeof(current));
+    if (sigaction(signalNumber, nullptr, &current) != 0) {
+        return false;
+    }
+    return current.sa_sigaction == handleSignal;
+}
+
+static void ensureHandlersArmed() {
+    for (int i = 0; i < kHandledCount; i++) {
+        if (ourHandlerIsInstalled(kHandledSignals[i])) {
+            continue;
+        }
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_sigaction = handleSignal;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        struct sigaction existing;
+        memset(&existing, 0, sizeof(existing));
+        if (sigaction(kHandledSignals[i], &action, &existing) != 0) {
+            continue;
+        }
+        if (existing.sa_sigaction != handleSignal) {
+            g_previous[i] = existing;
+        }
+    }
+}
+
+// --- abort() interception ---------------------------------------------------
+//
+// A game that decides to kill itself does not usually raise a signal by hand; it
+// calls abort(). That lands on the disposition currently installed for SIGABRT,
+// which by then belongs to the engine's reporter, not to us. Hooking abort()
+// makes the record unconditional: it is the last point before the process dies
+// and no other library can take it from us.
+//
+// Everything below runs with the same async-signal-safe constraints as the
+// signal handler: no allocation, no stdio, raw syscalls only.
+
+static void (*orig_abort)(void) = nullptr;
+
+// Walk the caller stack to find the first frame outside libc, so the record
+// points at the code that called abort() rather than at abort() itself.
+static void *callerFrame(void *pc) {
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr(pc, &info) == 0 || info.dli_fname == nullptr) {
+        return nullptr;
+    }
+    if (strstr(info.dli_fname, "/libc.so") != nullptr) {
+        return nullptr;
+    }
+    return pc;
+}
+
+static void my_abort() {
+    // __builtin_return_address(0) is the caller of abort(), i.e. the game.
+    void *pc = (void *) __builtin_return_address(0);
+    void *reported = callerFrame(pc);
+
+    char line[512];
+    size_t length = 0;
+    appendLiteral(line, sizeof(line), &length, "native_crash signal=SIGABRT(6) tid=");
+    appendSigned(line, sizeof(line), &length, (long) gettid());
+    appendLiteral(line, sizeof(line), &length, " source=abort()");
+    appendLiteral(line, sizeof(line), &length, " fault_addr=0x");
+    appendHex(line, sizeof(line), &length, (uintptr_t) reported);
+    appendLiteral(line, sizeof(line), &length, " pc=0x");
+    appendHex(line, sizeof(line), &length, (uintptr_t) pc);
+    appendLiteral(line, sizeof(line), &length, "\n");
+    line[length < sizeof(line) ? length : sizeof(line) - 1] = '\0';
+    appendRecordToFile(g_internalPath, &g_internalReady, line, length);
+    appendRecordToFile(g_sharedPath, &g_sharedReady, line, length);
+
+    if (reported != nullptr) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(reported, &info) != 0 && info.dli_fname != nullptr) {
+            char moduleLine[512];
+            size_t moduleLength = 0;
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength,
+                          "native_crash_module signal=SIGABRT(6) pc=0x");
+            appendHex(moduleLine, sizeof(moduleLength), &moduleLength, (uintptr_t) reported);
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, " lib=");
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, info.dli_fname);
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "+0x");
+            appendHex(moduleLine, sizeof(moduleLength), &moduleLength,
+                      (uintptr_t) reported - (uintptr_t) info.dli_fbase);
+            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "\n");
+            moduleLine[moduleLength < sizeof(moduleLength) ? moduleLength
+                                                          : sizeof(moduleLength) - 1] = '\0';
+            appendRecordToFile(g_internalPath, &g_internalReady, moduleLine, moduleLength);
+            appendRecordToFile(g_sharedPath, &g_sharedReady, moduleLine, moduleLength);
+            __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", moduleLine);
+        }
+    }
+    __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", line);
+
+    if (orig_abort != nullptr) {
+        orig_abort();
+    }
+    // abort() is not allowed to return, but if our replacement did, leave no
+    // way for the caller to continue past a deliberate self-termination.
+    _exit(134);
+}
+
+static void installAbortHook() {
+    void *target = resolve_libc("abort");
+    if (target == nullptr) {
+        return;
+    }
+    if (DobbyHook(target, (void *) my_abort, (void **) &orig_abort) != 0) {
+        return;
+    }
+}
+
 // A game engine and its crash reporter install their own fatal-signal handlers
-// well after the guest binds, silently replacing ours. Re-arming on a timer keeps
-// our recorder in front of theirs so a crash record is always written.
+// well after the guest binds, silently replacing ours. This thread notices and
+// re-arms, but only for the signals whose disposition actually drifted.
 void *rearmLoop(void *) {
     for (;;) {
         struct timespec pause;
-        pause.tv_sec = 0;
-        pause.tv_nsec = 500 * 1000 * 1000;
+        pause.tv_sec = 1;
+        pause.tv_nsec = 0;
         nanosleep(&pause, nullptr);
-        armHandlers();
+        ensureHandlersArmed();
     }
     return nullptr;
 }
@@ -270,6 +417,7 @@ void NativeCrashHandler::install(const char *internalDirectory, const char *shar
 
     writeArmProbe();
     armHandlers();
+    installAbortHook();
 
     pthread_t watchdog;
     if (pthread_create(&watchdog, nullptr, rearmLoop, nullptr) == 0) {
