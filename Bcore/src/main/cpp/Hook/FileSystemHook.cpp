@@ -92,12 +92,15 @@ int new_open(const char *pathname, int flags, ...) {
         errno = ENOENT;
         return -1;
     }
-    bool owned = false;
-    const char *redirected = IO::redirectPath(pathname, &owned);
     if (orig_open == nullptr) {
+        // Reached only if the hook is somehow live without an original, which
+        // means the symbol resolved but DobbyHook failed. Bail before
+        // redirecting so the relocated buffer is not leaked.
         errno = ENOENT;
         return -1;
     }
+    bool owned = false;
+    const char *redirected = IO::redirectPath(pathname, &owned);
     va_list args;
     va_start(args, flags);
     mode_t mode = modeRequired(flags) ? va_arg(args, mode_t) : 0;
@@ -121,12 +124,15 @@ int new_open64(const char *pathname, int flags, ...) {
         errno = ENOENT;
         return -1;
     }
-    bool owned = false;
-    const char *redirected = IO::redirectPath(pathname, &owned);
     if (orig_open64 == nullptr) {
+        // Reached only if the hook is somehow live without an original, which
+        // means the symbol resolved but DobbyHook failed. Bail before
+        // redirecting so the relocated buffer is not leaked.
         errno = ENOENT;
         return -1;
     }
+    bool owned = false;
+    const char *redirected = IO::redirectPath(pathname, &owned);
     va_list args;
     va_start(args, flags);
     mode_t mode = modeRequired(flags) ? va_arg(args, mode_t) : 0;
@@ -148,12 +154,15 @@ int new_openat(int dirfd, const char *pathname, int flags, ...) {
         errno = ENOENT;
         return -1;
     }
-    bool owned = false;
-    const char *redirected = IO::redirectPath(pathname, &owned);
     if (orig_openat == nullptr) {
+        // Reached only if the hook is somehow live without an original, which
+        // means the symbol resolved but DobbyHook failed. Bail before
+        // redirecting so the relocated buffer is not leaked.
         errno = ENOENT;
         return -1;
     }
+    bool owned = false;
+    const char *redirected = IO::redirectPath(pathname, &owned);
     va_list args;
     va_start(args, flags);
     mode_t mode = modeRequired(flags) ? va_arg(args, mode_t) : 0;
@@ -175,12 +184,15 @@ int new_openat64(int dirfd, const char *pathname, int flags, ...) {
         errno = ENOENT;
         return -1;
     }
-    bool owned = false;
-    const char *redirected = IO::redirectPath(pathname, &owned);
     if (orig_openat64 == nullptr) {
+        // Reached only if the hook is somehow live without an original, which
+        // means the symbol resolved but DobbyHook failed. Bail before
+        // redirecting so the relocated buffer is not leaked.
         errno = ENOENT;
         return -1;
     }
+    bool owned = false;
+    const char *redirected = IO::redirectPath(pathname, &owned);
     va_list args;
     va_start(args, flags);
     mode_t mode = modeRequired(flags) ? va_arg(args, mode_t) : 0;
