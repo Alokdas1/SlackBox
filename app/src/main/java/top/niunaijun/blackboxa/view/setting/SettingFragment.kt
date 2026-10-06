@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Environment
 import android.view.Gravity
 import android.widget.ScrollView
 import android.widget.TextView
@@ -122,10 +123,16 @@ class SettingFragment : PreferenceFragmentCompat() {
 
     private fun initGuestDiagnostics() {
         findPreference<Preference>("view_guest_diagnostics")?.setOnPreferenceClickListener {
-            val file = File(requireContext().filesDir, "crash_logs/guest_events.jsonl")
-            val recentEvents = readRecentEvents(file)
+            // Never let a diagnostics failure produce a blank dialog -- a broken
+            // diagnostics screen is worse than a noisy one when it is the only
+            // window into a death.
+            val report = try {
+                buildGuestDiagnosticsReport()
+            } catch (error: Throwable) {
+                "Guest diagnostics failed: ${error.javaClass.simpleName}: ${error.message}"
+            }
             val content = TextView(requireContext()).apply {
-                text = recentEvents
+                text = report
                 typeface = Typeface.MONOSPACE
                 textSize = 12f
                 setTextIsSelectable(false)
@@ -134,14 +141,14 @@ class SettingFragment : PreferenceFragmentCompat() {
             }
             val scroll = ScrollView(requireContext()).apply { addView(content) }
             AlertDialog.Builder(requireContext())
-                    .setTitle("Recent guest diagnostics")
+                    .setTitle("Guest diagnostics")
                     .setView(scroll)
                     .setNeutralButton("Copy") { _, _ ->
                         val clipboard = requireContext()
                                 .getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                         if (clipboard != null) {
                             clipboard.setPrimaryClip(
-                                    ClipData.newPlainText("SlackBox guest diagnostics", recentEvents)
+                                    ClipData.newPlainText("SlackBox guest diagnostics", report)
                             )
                             toast("Guest diagnostics copied")
                         } else {
@@ -154,21 +161,147 @@ class SettingFragment : PreferenceFragmentCompat() {
         }
     }
 
-    private fun readRecentEvents(file: File): String {
-        val output = StringBuilder()
-        output.append("Guest lifecycle timeline\n")
-        output.append(if (file.isFile) readTail(file, 48 * 1024) else "No guest lifecycle events recorded yet.\n")
+    /**
+     * Deep scan over every diagnostic surface the container produces.
+     *
+     * Reliability matters more than tidiness here: a guest that dies with a native
+     * signal leaves its record outside the Java crash path, so the timeline alone
+     * is not enough. This reads the lifecycle timeline, counts and classifies it,
+     * and pulls both native and Java reports from the internal directory and the
+     * shared mirror (the internal one can be unreadable to an external collector).
+     */
+    private fun buildGuestDiagnosticsReport(): String {
+        val crashDirectory = File(requireContext().filesDir, "crash_logs")
+        val sharedDirectory = File(Environment.getExternalStorageDirectory(), "Download/logs")
+        val timelineFile = File(crashDirectory, "guest_events.jsonl")
+        val timeline = if (timelineFile.isFile) readTail(timelineFile, 64 * 1024) else ""
 
-        val crashDirectory = file.parentFile
-        val crashReports = crashDirectory?.listFiles { candidate ->
-            candidate.isFile && candidate.name.startsWith("crash_") && candidate.name.endsWith(".log")
-        }?.sortedByDescending { it.lastModified() }.orEmpty()
-        for (report in crashReports.take(3)) {
-            if (output.length >= 96 * 1024) break
-            output.append("\n--- Java crash report: ").append(report.name).append(" ---\n")
-            output.append(readTail(report, 16 * 1024)).append('\n')
+        val nativeReports = collectDiagnosticFiles(crashDirectory, sharedDirectory,
+                "native_crash_", ".log")
+        val javaReports = collectDiagnosticFiles(crashDirectory, null, "crash_", ".log")
+
+        val output = StringBuilder()
+        output.append("=== Guest diagnostics ===\n")
+        if (!crashDirectory.isDirectory) {
+            output.append("Crash directory missing: ").append(crashDirectory.absolutePath).append('\n')
+        }
+        output.append(summarizeTimeline(timeline))
+        output.append(artifactList("Native crash reports", nativeReports))
+        output.append(artifactList("Java crash reports", javaReports))
+
+        output.append("\n=== Lifecycle timeline ===\n")
+        output.append(timeline.ifBlank { "No guest lifecycle events recorded yet." })
+
+        appendReportBodies(output, "Native", nativeReports, 3, 24 * 1024)
+        appendReportBodies(output, "Java", javaReports, 3, 16 * 1024)
+        return output.toString()
+    }
+
+    // Flat JSON lines: pull one quoted field without dragging in a JSON parser.
+    private fun jsonField(line: String, key: String): String? {
+        val marker = "\"$key\":\""
+        val start = line.indexOf(marker)
+        if (start < 0) return null
+        val valueStart = start + marker.length
+        val valueEnd = line.indexOf('"', valueStart)
+        if (valueEnd < 0) return null
+        return line.substring(valueStart, valueEnd)
+    }
+
+    private fun summarizeTimeline(timeline: String): String {
+        if (timeline.isBlank()) return "Deep scan: no events.\n"
+        val counts = LinkedHashMap<String, Int>()
+        val exits = ArrayList<String>()
+        for (line in timeline.lineSequence()) {
+            val event = jsonField(line, "event") ?: continue
+            counts[event] = (counts[event] ?: 0) + 1
+            // Exact match only: a bare contains("crash") also matched
+            // native_crash_handler_armed and reported phantom exits.
+            val isExit = event == "guest_process_binder_died" ||
+                    event.endsWith("_crash") || event == "crash"
+            if (isExit) {
+                exits.add("  - " + decodeExit(jsonField(line, "detail").orEmpty()))
+            }
+        }
+        val output = StringBuilder()
+        output.append("Deep scan: ").append(counts.values.sum())
+        output.append(" events, ").append(counts.size).append(" types\n")
+        for ((event, count) in counts.entries.sortedByDescending { it.value }) {
+            output.append("  ").append(event).append(": ").append(count).append('\n')
+        }
+        if (exits.isNotEmpty()) {
+            output.append("Process exits:\n")
+            exits.forEach { output.append(it).append('\n') }
         }
         return output.toString()
+    }
+
+    // The platform reports SIGNALED plus a bare number; name it so the reader does
+    // not have to remember that 7 is SIGBUS.
+    private fun decodeExit(detail: String): String {
+        val reason = Regex("reason=([A-Z_]+)").find(detail)?.groupValues?.get(1)
+        val status = Regex("status=(-?\\d+)").find(detail)?.groupValues?.get(1)?.toIntOrNull()
+        return if (reason == "SIGNALED" && status != null) {
+            "SIGNALED -> ${signalName(status)} (signal $status)"
+        } else {
+            reason ?: "unspecified"
+        }
+    }
+
+    private fun signalName(signal: Int): String = when (signal) {
+        4 -> "SIGILL"
+        5 -> "SIGTRAP"
+        6 -> "SIGABRT"
+        7 -> "SIGBUS"
+        8 -> "SIGFPE"
+        9 -> "SIGKILL"
+        11 -> "SIGSEGV"
+        13 -> "SIGPIPE"
+        15 -> "SIGTERM"
+        else -> "signal"
+    }
+
+    private fun collectDiagnosticFiles(primary: File?, secondary: File?,
+                                       prefix: String, suffix: String): List<Pair<File, String>> {
+        val found = LinkedHashMap<String, Pair<File, String>>()
+        for (candidate in listOf(primary to "internal", secondary to "shared")) {
+            val directory = candidate.first ?: continue
+            if (!directory.isDirectory) continue
+            val matches = directory.listFiles { file ->
+                file.isFile && file.name.startsWith(prefix) && file.name.endsWith(suffix)
+            }.orEmpty()
+            for (match in matches) {
+                val existing = found[match.name]
+                if (existing == null || match.lastModified() > existing.first.lastModified()) {
+                    found[match.name] = match to candidate.second
+                }
+            }
+        }
+        return found.values.sortedByDescending { it.first.lastModified() }
+    }
+
+    private fun artifactList(title: String, reports: List<Pair<File, String>>): String {
+        val output = StringBuilder()
+        output.append('\n').append(title).append(": ").append(reports.size).append('\n')
+        if (reports.isEmpty()) {
+            output.append("  (none)\n")
+            return output.toString()
+        }
+        for ((file, origin) in reports) {
+            output.append("  - ").append(file.name)
+            output.append(" [").append(origin).append(", ").append(file.length() / 1024).append(" KB]\n")
+        }
+        return output.toString()
+    }
+
+    private fun appendReportBodies(output: StringBuilder, label: String,
+                                   reports: List<Pair<File, String>>, limit: Int, maxBytes: Int) {
+        for ((file, origin) in reports.take(limit)) {
+            if (output.length >= 256 * 1024) break
+            output.append("\n--- ").append(label).append(" crash report: ").append(file.name)
+            output.append(" (").append(origin).append(") ---\n")
+            output.append(readTail(file, maxBytes)).append('\n')
+        }
     }
 
     private fun readTail(file: File, maxBytes: Int): String = try {

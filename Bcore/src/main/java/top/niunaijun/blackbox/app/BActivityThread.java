@@ -22,6 +22,7 @@ import android.content.res.Resources;
 import android.os.Binder;
 import android.os.Build;
 import android.os.ConditionVariable;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.IInterface;
@@ -79,6 +80,7 @@ import top.niunaijun.blackbox.fake.service.HCallbackProxy;
 import top.niunaijun.blackbox.utils.Reflector;
 import top.niunaijun.blackbox.utils.SafeContextWrapper;
 import top.niunaijun.blackbox.utils.GlobalContextWrapper;
+import top.niunaijun.blackbox.utils.CrashMonitor;
 import top.niunaijun.blackbox.utils.Slog;
 import top.niunaijun.blackbox.utils.compat.ActivityManagerCompat;
 import top.niunaijun.blackbox.utils.compat.BuildCompat;
@@ -355,6 +357,53 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
     }
 
+    /**
+     * Arms the native signal handler in the guest process so a SIGBUS/SIGSEGV death
+     * records its fault address and library instead of vanishing as a bare Binder
+     * death. Diagnostics must never block the guest from binding, hence the swallow.
+     */
+    private static void installNativeCrashDiagnostics(String packageName, String processName) {
+        Context diagnosticsContext = BlackBoxCore.getContext();
+        if (diagnosticsContext == null) {
+            return;
+        }
+        File crashLogDirectory = new File(diagnosticsContext.getFilesDir(), "crash_logs");
+        if (!crashLogDirectory.isDirectory() && !crashLogDirectory.mkdirs()) {
+            return;
+        }
+        try {
+            String sharedCrashLogDirectory = resolveSharedCrashLogDirectory();
+            NativeCore.installNativeCrashHandler(crashLogDirectory.getAbsolutePath(),
+                    sharedCrashLogDirectory);
+            // Breadcrumb so the guest timeline shows whether the handler was armed
+            // before a death -- otherwise "no native_crash file" is ambiguous.
+            CrashMonitor.recordEvent("native_crash_handler_armed", packageName, processName,
+                    getUserId(), "", crashLogDirectory.getAbsolutePath()
+                            + " shared=" + sharedCrashLogDirectory);
+        } catch (Throwable ignored) {
+            Slog.w(TAG, "Native crash diagnostics unavailable");
+        }
+    }
+
+    /**
+     * The internal crash directory sits under the host app's private data, which an
+     * external collector cannot read. The shared one lands in a public folder. The
+     * native side opens it with raw syscalls so the guest's own IO redirect cannot
+     * reroute the crash record back into the sandbox.
+     */
+    private static String resolveSharedCrashLogDirectory() {
+        try {
+            File sharedCrashLogDirectory = new File(
+                    Environment.getExternalStorageDirectory(), "Download/logs");
+            if (!sharedCrashLogDirectory.isDirectory() && !sharedCrashLogDirectory.mkdirs()) {
+                return null;
+            }
+            return sharedCrashLogDirectory.getAbsolutePath();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     public synchronized void handleBindApplication(String packageName, String processName) {
         if (isInit())
             return;
@@ -400,6 +449,7 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
 
         NativeCore.init(Build.VERSION.SDK_INT);
+        installNativeCrashDiagnostics(packageName, processName);
         assert packageContext != null;
         IOCore.get().enableRedirect(packageContext);
 

@@ -34,6 +34,9 @@ public class NativeCore {
 
     public static native void hideXposed();
 
+    
+    public static native void installNativeCrashHandler(String internalDirectory, String sharedDirectory);
+
     public static native boolean disableHiddenApi();
     
     public static native boolean disableResourceLoading();

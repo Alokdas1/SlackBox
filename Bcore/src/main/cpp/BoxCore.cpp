@@ -14,6 +14,7 @@
 #include <Hook/DexFileHook.h>
 #include <Hook/RuntimeHook.h>
 #include "Utils/HexDump.h"
+#include "Utils/NativeCrashHandler.h"
 #include "hidden_api.h"
 
 struct {
@@ -131,7 +132,25 @@ bool disableResourceLoading(JNIEnv *env, jclass clazz) {
     return true;
 }
 
+void installNativeCrashHandler(JNIEnv *env, jclass clazz, jstring internal_directory,
+                               jstring shared_directory) {
+    const char *internal = env->GetStringUTFChars(internal_directory, JNI_FALSE);
+    const char *shared = shared_directory != nullptr
+                         ? env->GetStringUTFChars(shared_directory, JNI_FALSE)
+                         : nullptr;
+    ALOGD("set installNativeCrashHandler: internal=%s shared=%s",
+          internal != nullptr ? internal : "(none)", shared != nullptr ? shared : "(none)");
+    NativeCrashHandler::install(internal, shared);
+    if (internal != nullptr) {
+        env->ReleaseStringUTFChars(internal_directory, internal);
+    }
+    if (shared != nullptr) {
+        env->ReleaseStringUTFChars(shared_directory, shared);
+    }
+}
+
 static JNINativeMethod gMethods[] = {
+        {"installNativeCrashHandler", "(Ljava/lang/String;Ljava/lang/String;)V", (void *) installNativeCrashHandler},
         {"disableHiddenApi", "()Z",                               (void *) disableHiddenApi},
         {"disableResourceLoading", "()Z",                         (void *) disableResourceLoading},
         {"hideXposed", "()V",                                     (void *) hideXposed},

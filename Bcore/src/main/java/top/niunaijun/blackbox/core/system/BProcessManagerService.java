@@ -176,7 +176,8 @@ public class BProcessManagerService implements ISystemService {
                     Log.d(TAG, "App Died: " + app.processName);
                     CrashMonitor.recordEvent("guest_process_binder_died", app.getPackageName(),
                             app.processName, app.userId, "",
-                            "cause=unknown; Binder death does not distinguish crash from normal exit");
+                            CrashMonitor.describeProcessExit(app.pid,
+                                    ProxyManifest.getProcessName(app.bpid)));
                     appThread.unlinkToDeath(this, 0);
                     onProcessDie(app);
                 }

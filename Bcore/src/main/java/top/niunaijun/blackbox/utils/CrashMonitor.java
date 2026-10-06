@@ -352,4 +352,121 @@ public class CrashMonitor {
         sNativeCrashes.set(0);
         Slog.d(TAG, "Crash history cleared");
     }
+
+    /**
+     * Best-effort, sandbox-legal cause for a guest process that just vanished.
+     *
+     * A Binder death proves the guest is gone but not why. Guest apps run as
+     * proxy processes of the host package (host:pN), so the host can ask the
+     * platform for its own historical exit reasons. That API is API 30+, so the
+     * ApplicationExitInfo-touching code lives in a nested holder that is never
+     * loaded on older devices -- the outer method resolves it only after the
+     * SDK_INT guard.
+     *
+     * The hook layer also rewrites getHistoricalProcessExitReasons to an empty
+     * list; that hook is the reason this may still report no record. If it does,
+     * the death is being hidden from us by our own proxy, not missing from the
+     * platform, and the capture path is logcat/tombstone instead.
+     */
+    public static String describeProcessExit(int pid, String processName) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return "cause=unknown; ApplicationExitInfo requires API 30+ (device is API "
+                    + Build.VERSION.SDK_INT + ")";
+        }
+        return ExitReasonReader.describe(pid, processName);
+    }
+
+    private static final class ExitReasonReader {
+        static String describe(int pid, String processName) {
+            Context context = BlackBoxCore.getContext();
+            if (context == null) {
+                return "cause=unknown; no host context for exit-reason query";
+            }
+            try {
+                android.app.ActivityManager manager =
+                        (android.app.ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+                if (manager == null) {
+                    return "cause=unknown; no ActivityManager";
+                }
+                // 128, not 32: a game that respawns generates exits faster than a
+                // human can open the diagnostics screen, so the guest's record is
+                // routinely outside the most recent 32.
+                java.util.List<android.app.ApplicationExitInfo> reasons =
+                        manager.getHistoricalProcessExitReasons(null, 0, 128);
+                android.app.ApplicationExitInfo match = null;
+                // Prefer a name match over a pid match. ApplicationExitInfo reports
+                // the pids the platform saw, which are usually but not always the
+                // same value SlackBox recorded for the guest proxy.
+                for (android.app.ApplicationExitInfo info : reasons) {
+                    if (matchesProcessName(info.getProcessName(), processName)) {
+                        match = info;
+                        break;
+                    }
+                }
+                if (match == null) {
+                    for (android.app.ApplicationExitInfo info : reasons) {
+                        if (pid > 0 && info.getPid() == pid) {
+                            match = info;
+                            break;
+                        }
+                    }
+                }
+                if (match == null) {
+                    return "cause=unknown; platform kept no exit record for pid=" + pid
+                            + " process=" + processName
+                            + " (scanned " + reasons.size() + " recent exits)";
+                }
+                CharSequence description = match.getDescription();
+                return "reason=" + reasonName(match.getReason())
+                        + "; status=" + match.getStatus()
+                        + "; importance=" + match.getImportance()
+                        + "; pss=" + match.getPss() + "kB"
+                        + "; rss=" + match.getRss() + "kB"
+                        + "; at=" + match.getTimestamp()
+                        + "; description=" + (description == null ? "" : description);
+            } catch (Throwable t) {
+                return "cause=unknown; exit-reason query failed: " + t;
+            }
+        }
+
+        /**
+         * ApplicationExitInfo.getProcessName() returns the platform's full
+         * "pkg:proc" string. ProxyManifest.getProcessName(bpid) returns our own
+         * generated guest process label, which for a multi-process guest does not
+         * carry the same suffix, so equals() never matched and the pid fallback
+         * was doing all the work. Compare on containment in both directions:
+         * either string containing the other covers the exact case, the colon
+         * suffix, and the "app.p0" style names the platform reports.
+         */
+        private static boolean matchesProcessName(String reported, String wanted) {
+            if (reported == null || wanted == null || wanted.isEmpty()) {
+                return false;
+            }
+            return reported.equals(wanted)
+                    || reported.contains(wanted)
+                    || wanted.contains(reported);
+        }
+
+        private static String reasonName(int reason) {
+            switch (reason) {
+                case android.app.ApplicationExitInfo.REASON_EXIT_SELF: return "EXIT_SELF";
+                case android.app.ApplicationExitInfo.REASON_SIGNALED: return "SIGNALED";
+                case android.app.ApplicationExitInfo.REASON_LOW_MEMORY: return "LOW_MEMORY";
+                case android.app.ApplicationExitInfo.REASON_CRASH: return "CRASH_JAVA";
+                case android.app.ApplicationExitInfo.REASON_CRASH_NATIVE: return "CRASH_NATIVE";
+                case android.app.ApplicationExitInfo.REASON_ANR: return "ANR";
+                case android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE: return "INIT_FAILURE";
+                case android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE: return "PERMISSION_CHANGE";
+                case android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE: return "EXCESSIVE_RESOURCE";
+                case android.app.ApplicationExitInfo.REASON_USER_REQUESTED: return "USER_REQUESTED";
+                case android.app.ApplicationExitInfo.REASON_USER_STOPPED: return "USER_STOPPED";
+                case android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED: return "DEPENDENCY_DIED";
+                case android.app.ApplicationExitInfo.REASON_FREEZER: return "FREEZER";
+                case android.app.ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE: return "PACKAGE_STATE_CHANGE";
+                case android.app.ApplicationExitInfo.REASON_PACKAGE_UPDATED: return "PACKAGE_UPDATED";
+                case android.app.ApplicationExitInfo.REASON_OTHER: return "OTHER";
+                default: return "UNKNOWN(" + reason + ")";
+            }
+        }
+    }
 }
