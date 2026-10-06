@@ -157,7 +157,7 @@ void installNativeCrashHandler(JNIEnv *env, jclass clazz, jstring internal_direc
 }
 
 static JNINativeMethod gMethods[] = {
-        {"installNativeCrashHandler", "(Ljava/lang/String;Ljava/lang/String;)V", (void *) installNativeCrashHandler},
+        {"installNativeCrashHandler", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void *) installNativeCrashHandler},
         {"disableHiddenApi", "()Z",                               (void *) disableHiddenApi},
         {"disableResourceLoading", "()Z",                         (void *) disableResourceLoading},
         {"hideXposed", "()V",                                     (void *) hideXposed},
