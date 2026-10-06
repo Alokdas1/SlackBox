@@ -188,312 +188,23 @@ void appendModuleRecord(char *out, size_t capacity, const char *tag, uintptr_t p
 void commitRecord(const char *record);
 void dumpProcMaps();
 int walkInterruptedStack(uintptr_t *out, int maxFrames, uintptr_t framePointer,
-                         uintptr_t linkRegister, uintptr_t anchorSp);
-static void noteForeignHandler(int index, const struct sigaction *act);
-static void installOurHandler(int signum);
-
-void handleSignal(int signalNumber, siginfo_t *info, void *rawContext) {
-    if (g_reentered) {
-        _exit(128 + signalNumber);
-    }
-    g_reentered = 1;
-
-    void *faultAddress = info != nullptr ? info->si_addr : nullptr;
-    void *programCounter = nullptr;
-    uintptr_t framePointer = 0;
-    uintptr_t linkRegister = 0;
-    uintptr_t stackPointer = 0;
-    ucontext_t *context = (ucontext_t *) rawContext;
-    if (context != nullptr) {
-#if defined(__aarch64__)
-        programCounter = (void *) context->uc_mcontext.pc;
-        framePointer = (uintptr_t) context->uc_mcontext.regs[29];
-        linkRegister = (uintptr_t) context->uc_mcontext.regs[30];
-        stackPointer = (uintptr_t) context->uc_mcontext.sp;
-#elif defined(__arm__)
-        programCounter = (void *) context->uc_mcontext.arm_pc;
-        framePointer = (uintptr_t) context->uc_mcontext.arm_fp;
-        linkRegister = (uintptr_t) context->uc_mcontext.arm_lr;
-        stackPointer = (uintptr_t) context->uc_mcontext.arm_sp;
-#endif
-    }
-
-    char line[512];
-    size_t length = 0;
-    appendLiteral(line, sizeof(line), &length, "native_crash signal=");
-    appendLiteral(line, sizeof(line), &length, signalName(signalNumber));
-    appendLiteral(line, sizeof(line), &length, "(");
-    appendSigned(line, sizeof(line), &length, signalNumber);
-    appendLiteral(line, sizeof(line), &length, ") tid=");
-    appendSigned(line, sizeof(line), &length, (long) gettid());
-    appendLiteral(line, sizeof(line), &length, " fault_addr=0x");
-    appendHex(line, sizeof(line), &length, (uintptr_t) faultAddress);
-    appendLiteral(line, sizeof(line), &length, " pc=0x");
-    appendHex(line, sizeof(line), &length, (uintptr_t) programCounter);
-    appendLiteral(line, sizeof(line), &length, "\n");
-    line[length < sizeof(line) ? length : sizeof(line) - 1] = '\0';
-
-// Commit the async-signal-safe essentials before consulting the dynamic
-    // linker. dladdr() is not async-signal-safe; if it faults while the loader
-    // lock is held, a re-entry would otherwise _exit before writing any report.
-    writeRecordToAllSinks(line, length);
-
-    // Raw program counters first, still without the loader lock. On SIGBUS and
-    // SIGSEGV the fault address in si_addr is the single most useful field and
-    // it is already in the line above; the stack is what turns it into a file
-    // and an offset.
-    int frameCount = walkInterruptedStack(g_traceFrames, kMaxTraceFrames,
-                                          framePointer, linkRegister, stackPointer);
-    for (int i = 0; i < frameCount; i++) {
-        char frameLine[256];
-        appendRawFrameRecord(frameLine, sizeof(frameLine), "native_crash_frame", g_traceFrames[i]);
-        commitRecord(frameLine);
-    }
-
-    if (programCounter != nullptr) {
-        Dl_info symbol;
-        memset(&symbol, 0, sizeof(symbol));
-        {
-            // Written unconditionally: on pid 17877 dladdr() failed for the
-            // faulting pc (0x681f0dc8, an unmapped/JIT page) and the record was
-            // skipped, so the one address that mattered went unrecorded.
-            char pcRecord[512];
-            appendModuleRecord(pcRecord, sizeof(pcRecord), "native_crash_pc", (uintptr_t) programCounter);
-            commitRecord(pcRecord);
-        }
-        if (dladdr(programCounter, &symbol) != 0 && symbol.dli_fname != nullptr) {
-            char moduleLine[512];
-            size_t moduleLength = 0;
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength,
-                          "native_crash_module signal=");
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength,
-                          signalName(signalNumber));
-            appendLiteral(moduleLine, sizeof(moduleLine), &moduleLength, " pc=0x");
-            appendHex(moduleLine, sizeof(moduleLength), &moduleLength,
-                      (uintptr_t) programCounter);
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, " lib=");
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, symbol.dli_fname);
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "+0x");
-            appendHex(moduleLine, sizeof(moduleLength), &moduleLength,
-                      (uintptr_t) programCounter - (uintptr_t) symbol.dli_fbase);
-            appendLiteral(moduleLine, sizeof(moduleLength), &moduleLength, "\n");
-            moduleLine[moduleLength < sizeof(moduleLength) ? moduleLength : sizeof(moduleLength) - 1] = '\0';
-            writeRecordToAllSinks(moduleLine, moduleLength);
-            __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", moduleLine);
-        }
-    }
-
-    for (int i = 0; i < frameCount; i++) {
-        char symbolLine[512];
-        appendModuleRecord(symbolLine, sizeof(symbolLine), "native_crash_symbol", g_traceFrames[i]);
-        commitRecord(symbolLine);
-    }
-
-    dumpProcMaps();
-
-    // The durable record is already written. Logcat is a best-effort extra
-    // channel because Android logging is not async-signal-safe either.
-    __android_log_write(ANDROID_LOG_ERROR, "SLACKBOX_NATIVE_CRASH", line);
-
-    chainToPrevious(signalNumber, info, rawContext);
-}
-
-// Records that the write path works, before any crash has happened. If the file
-// exists but never grows a crash line, the handler is not being invoked -- which
-// points at a crash reporter installed after us, not at a broken write.
-void writeArmProbe() {
-    char line[384];
-    size_t length = 0;
-    appendLiteral(line, sizeof(line), &length, "native_handler_armed pid=");
-    appendSigned(line, sizeof(line), &length, (long) getpid());
-    appendLiteral(line, sizeof(line), &length, " internal=");
-    appendLiteral(line, sizeof(line), &length, g_internalPath);
-    appendLiteral(line, sizeof(line), &length, " shared=");
-    appendLiteral(line, sizeof(line), &length, g_sharedPath);
-    appendLiteral(line, sizeof(line), &length, " download=");
-    appendLiteral(line, sizeof(line), &length, g_downloadPath[0] != '\0' ? g_downloadPath : "<none>");
-    appendLiteral(line, sizeof(line), &length, "\n");
-    writeRecordToAllSinks(line, length);
-}
-
-// Resolving one libc symbol through xdl, the same pattern VirtualSpoof uses.
-// Kept as a helper because the abort hook below needs it too.
-static void *resolve_libc(const char *symbol) {
-    void *handle = xdl_open("libc.so", XDL_DEFAULT);
-    if (!handle) {
-        return nullptr;
-    }
-    void *target = xdl_dsym(handle, symbol, nullptr);
-    xdl_close(handle);
-    return target;
-}
-
-void armHandlers() {
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_sigaction = handleSignal;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&action.sa_mask);
-    for (int i = 0; i < kHandledCount; i++) {
-        struct sigaction existing;
-        memset(&existing, 0, sizeof(existing));
-        if (sigaction(kHandledSignals[i], &action, &existing) != 0) {
-            continue;
-        }
-        // Remember the newest foreign handler so we can chain to it. Our own
-        // handler must never become the "previous" -- that would recurse forever.
-        if (existing.sa_sigaction != handleSignal) {
-            g_previous[i] = existing;
-        }
-    }
-}
-
-// Re-arm only when the disposition is no longer ours.
-//
-// The previous version re-armed unconditionally every 500ms. That is a fight
-// neither side wins: the engine installs its reporter, our timer overwrites it,
-// the engine reinstalls, and whichever call lands last owns SIGABRT when the
-// process dies. Measured on com.proxima.dfm: the arm probe wrote at t+0.1s, the
-// guest died by abort() at t+51.5s, and the crash file contained the arm line
-// and nothing else -- our handler never ran, because the engine's reporter
-// owned the disposition at that moment.
-//
-// Comparing before writing costs six sigaction calls only when something
-// actually changed, and lets the engine's handler stand until it needs to be
-// replaced. SIGABRT is additionally caught at the abort() call site below, so a
-// self-abort is recorded regardless of who owns the signal disposition.
-static bool ourHandlerIsInstalled(int signalNumber) {
-    struct sigaction current;
-    memset(&current, 0, sizeof(current));
-    if (sigaction(signalNumber, nullptr, &current) != 0) {
-        return false;
-    }
-    return current.sa_sigaction == handleSignal;
-}
-
-// Backstop only. The sigaction hook below keeps us outermost for anything that
-// goes through the public entry point; this catches installers that reach past
-// it (__sigaction, or a raw rt_sigaction), and re-installs without re-logging an
-// owner we have already recorded.
-static void ensureHandlersArmed() {
-    for (int i = 0; i < kHandledCount; i++) {
-        if (ourHandlerIsInstalled(kHandledSignals[i])) {
-            continue;
-        }
-        struct sigaction current;
-        memset(&current, 0, sizeof(current));
-        if (sigaction(kHandledSignals[i], nullptr, &current) == 0) {
-            noteForeignHandler(i, &current);
-        }
-        installOurHandler(kHandledSignals[i]);
-    }
-}
-
-// --- abort() interception ---------------------------------------------------
-//
-// A game that decides to kill itself does not usually raise a signal by hand; it
-// calls abort(). That lands on the disposition currently installed for SIGABRT,
-// which by then belongs to the engine's reporter, not to us. Hooking abort()
-// makes the record unconditional: it is the last point before the process dies
-// and no other library can take it from us.
-//
-// Measured on com.proxima.dfm at t+45.6s: the guest's own crash reporter caught
-// SIGBUS(7), and its own termination path called abort(). The kernel still
-// reported the original fatal signal, so the exit reason stays SIGNALED/7 while
-// the abort hook is the only place the fault is visible. That is why this hook
-// unwinds a real stack instead of logging one return address -- the frame above
-// abort() is inside libc (fault_addr came back 0x0 and no module line was
-// emitted), so a single pc names libc and nothing else.
-//
-// Everything below runs with the same async-signal-safe constraints as the
-// signal handler: no allocation, no stdio, raw syscalls only. The raw program
-// counters are committed to disk before dladdr() is consulted, because dladdr
-// takes the loader lock and can fault if that lock is already held.
-
-static void (*orig_abort)(void) = nullptr;
-
-_Unwind_Reason_Code collectTraceFrame(struct _Unwind_Context *context, void *argument) {
-    (void) argument;
-    if (g_traceFrameCount >= kMaxTraceFrames) {
-        return _URC_END_OF_STACK;
-    }
-    uintptr_t pc = (uintptr_t) _Unwind_GetIP(context);
-    if (pc == 0) {
-        return _URC_END_OF_STACK;
-    }
-    g_traceFrames[g_traceFrameCount++] = pc;
-    return _URC_NO_REASON;
-}
-
-int captureTraceFrames() {
-    g_traceFrameCount = 0;
-    _Unwind_Backtrace(collectTraceFrame, nullptr);
-    return (int) g_traceFrameCount;
-}
-
-// --- stack walking across a signal boundary ----------------------------------
-//
-// _Unwind_Backtrace is the wrong tool inside a signal handler here, for two
-// reasons, both observed on com.proxima.dfm pid 17877:
-//
-//  1. It cannot cross the signal frame. That run returned exactly two frames --
-//     libblackbox.so+0x2778c (the handler trampoline) and then [vdso] with
-//     sym=__kernel_rt_sigreturn -- and stopped. The faulting context was never
-//     reached, so the backtrace named our own code and told us nothing.
-//
-//  2. Running it there is not safe. It faults while reading a stack that is
-//     already broken, which re-enters the handler and hits the g_reentered guard
-//     -> _exit(128 + 11). Android then reported reason=EXIT_SELF status=139 and
-//     the guest crash-looped immediately instead of dying once at ~48s.
-//
-// The interrupted context is the one place where the guest's real stack is
-// available, so read it directly: seed from the ucontext frame/link registers,
-// then walk the frame chain by hand. Every pointer is range-checked before it
-// is dereferenced, so a corrupt stack ends the walk instead of faulting.
-const uintptr_t kUserAddressLimit = 0x0000FFFFFFFFFFFFULL; // 48-bit user VA
-const uintptr_t kStackWindowBytes = 512 * 1024;
-
-static bool plausibleCodeAddress(uintptr_t pc) {
-    return pc != 0 && pc < kUserAddressLimit && (pc & 0x3) == 0;
-}
-
-static bool plausibleStackPointer(uintptr_t sp, uintptr_t anchorSp) {
-    if ((sp & 0x7) != 0) {
-        return false;
-    }
-    // Callers sit at higher addresses than the frame we are standing in.
-    if (sp < anchorSp) {
-        return false;
-    }
-    return sp - anchorSp < kStackWindowBytes;
-}
-
-int walkInterruptedStack(uintptr_t *out, int maxFrames, uintptr_t framePointer,
                          uintptr_t linkRegister, uintptr_t anchorSp) {
+    (void) framePointer;
+    (void) anchorSp;
     int count = 0;
-    uintptr_t sp = anchorSp;
-
+    // Only the link register. An earlier version also followed the frame-pointer
+    // chain and produced one frame per run: libart.so+0x270fc4 on one run, an
+    // unresolved address on the next, then a stop.
+    //
+    // That is the expected result, because Android's arm64 code is built without
+    // frame pointers -- x29 is an ordinary callee-saved register holding
+    // whatever the faulting code last put there. "Validating" a garbage x29
+    // against a plausible stack range passes often enough to be dangerous, and
+    // dereferencing it inside a signal handler is exactly how this path turned a
+    // guest crash into EXIT_SELF status=139. One frame is all the chain could
+    // honestly give, so take the one frame that needs no dereference.
     if (plausibleCodeAddress(linkRegister) && count < maxFrames) {
         out[count++] = linkRegister;
-    }
-
-    uintptr_t fp = framePointer;
-    for (int step = 0; step < maxFrames && count < maxFrames; step++) {
-        if (!plausibleStackPointer(fp, sp)) {
-            break;
-        }
-        // Validate both words we are about to read before reading either.
-        uintptr_t nextFp = *(uintptr_t *) fp;
-        uintptr_t returnPc = *(uintptr_t *) (fp + sizeof(uintptr_t));
-        if (!plausibleCodeAddress(returnPc)) {
-            break;
-        }
-        out[count++] = returnPc;
-        if (!plausibleStackPointer(nextFp, fp) || nextFp == fp) {
-            break;
-        }
-        sp = fp;
-        fp = nextFp;
     }
     return count;
 }
@@ -588,6 +299,11 @@ void dumpProcMaps() {
         char mapPath[256];
         size_t pathLength = 0;
         appendLiteral(mapPath, sizeof(mapPath), &pathLength, sinks[s]);
+        // Terminate before scanning: appendLiteral() does not terminate, so
+        // strrchr() ran off into uninitialised stack, produced a garbage path,
+        // and the open failed. That is why no native_maps_<pid>.log ever
+        // appeared on any run.
+        mapPath[pathLength < sizeof(mapPath) ? pathLength : sizeof(mapPath) - 1] = '\0';
         // native_crash_1234.log -> native_maps_1234.log
         const char *lastSlash = strrchr(mapPath, '/');
         pathLength = lastSlash != nullptr ? (size_t) (lastSlash - mapPath) + 1 : 0;
@@ -703,8 +419,22 @@ static int indexOfSignal(int signum) {
     return -1;
 }
 
-// Deduplicates: both the sigaction hook and the re-arm backstop funnel through
-// here, and without this the file filled with repeats of the same owner.
+// Records a foreign handler for a signal. Deliberately does no file I/O and no
+// logging.
+//
+// This runs inside somebody else's sigaction() call, six times during guest
+// startup. The previous version opened and wrote three files and called
+// __android_log_write from there, on a caller's stack and possibly while that
+// caller held a lock that logd or the filesystem also wants. Whatever the
+// precise mechanism, the guest stopped rendering entirely after that change
+// (zero activity_started, versus a 2400x1080 surface in earlier runs), and every
+// death was reported as EXIT_SELF status=139.
+//
+// Observation has to be inert. Note the owner in memory here, and let the
+// one-second thread do the writing in flushDisplacementLog().
+static volatile sig_atomic_t g_displaced[kHandledCount];
+static struct sigaction g_loggedForeign[kHandledCount];
+
 static void noteForeignHandler(int index, const struct sigaction *act) {
     if (index < 0 || act == nullptr) {
         return;
@@ -713,20 +443,36 @@ static void noteForeignHandler(int index, const struct sigaction *act) {
         return;
     }
     g_previous[index] = *act;
+    g_displaced[index] = 1;
+}
 
-    char line[512];
-    appendModuleRecord(line, sizeof(line), "native_crash_displaced",
-                       (uintptr_t) act->sa_sigaction);
-    size_t length = strlen(line);
-    while (length > 0 && line[length - 1] != '\n') {
-        line[--length] = '\0';
+// Runs on the re-arm thread, never in a signal path. One record per owner, so
+// the file does not fill with repeats.
+static void flushDisplacementLog() {
+    for (int i = 0; i < kHandledCount; i++) {
+        if (g_displaced[i] == 0) {
+            continue;
+        }
+        g_displaced[i] = 0;
+        uintptr_t owner = (uintptr_t) g_previous[i].sa_sigaction;
+        if (owner == 0 || g_loggedForeign[i].sa_sigaction == g_previous[i].sa_sigaction) {
+            continue;
+        }
+        g_loggedForeign[i] = g_previous[i];
+
+        char line[512];
+        appendModuleRecord(line, sizeof(line), "native_crash_displaced", owner);
+        size_t length = strlen(line);
+        while (length > 0 && line[length - 1] != '\n') {
+            line[--length] = '\0';
+        }
+        size_t used = length;
+        appendLiteral(line, sizeof(line), &used, " signal=");
+        appendLiteral(line, sizeof(line), &used, signalName(kHandledSignals[i]));
+        appendLiteral(line, sizeof(line), &used, " disposition=wrapped_owned_by_us=1\n");
+        line[used < sizeof(line) ? used : sizeof(line) - 1] = '\0';
+        commitRecord(line);
     }
-    size_t used = length;
-    appendLiteral(line, sizeof(line), &used, " signal=");
-    appendLiteral(line, sizeof(line), &used, signalName(kHandledSignals[index]));
-    appendLiteral(line, sizeof(line), &used, " disposition=wrapped_owned_by_us=1\n");
-    line[used < sizeof(line) ? used : sizeof(line) - 1] = '\0';
-    commitRecord(line);
 }
 
 static void installOurHandler(int signum) {
@@ -787,6 +533,7 @@ void *rearmLoop(void *) {
         pause.tv_nsec = 0;
         nanosleep(&pause, nullptr);
         ensureHandlersArmed();
+        flushDisplacementLog();
     }
     return nullptr;
 }
