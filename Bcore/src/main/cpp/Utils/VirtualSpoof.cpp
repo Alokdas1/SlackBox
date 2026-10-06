@@ -105,13 +105,28 @@ const SuppressedValue kSuppressedValues[] = {
     {"ro.build.characteristics", "emulator"},
 };
 
+// Prototypes below are transcribed from
+// <sys/system_properties.h> in the NDK sysroot. Do not write these from memory.
+//
+// An earlier revision of this file declared __system_property_find as
+// void(const char*, const prop_info**) and __system_property_read as
+// int(const prop_info*, char*, int*). Neither matches libc: find() returns the
+// prop_info* in x0 and takes one argument, and read() takes (pi, name, value).
+// The mismatched find() replacement left a real caller's prop_info* return
+// value unset, so the caller passed garbage to __system_property_serial, which
+// dereferenced it. Guest startup died with SIGBUS at
+// __system_property_serial+4, fault addr 0xfffffffffffffffe, inside
+// IOCore.enableRedirect -- the frame that calls NativeCore.enableIO() and so
+// installs these hooks. A hook with the wrong signature is worse than no hook:
+// it corrupts every call rather than merely failing to intercept one.
+
 int (*orig_system_property_get)(const char *name, char *value) = nullptr;
 int (*orig_system_property_read_callback)(const prop_info *pi,
                                           void (*callback)(void *cookie, const char *name,
                                                            const char *value, uint32_t serial),
                                           void *cookie) = nullptr;
-void (*orig_system_property_find)(const char *name, const prop_info **pi) = nullptr;
-int (*orig_system_property_read)(const prop_info *pi, char *value, int *value_len) = nullptr;
+const prop_info *(*orig_system_property_find)(const char *name) = nullptr;
+int (*orig_system_property_read)(const prop_info *pi, char *name, char *value) = nullptr;
 
 bool shouldSuppressKey(const char *name) {
     for (const auto &entry : kAbsentProperties) {
@@ -129,30 +144,6 @@ bool shouldSuppressValue(const char *name, const char *value) {
     }
     for (const auto &entry : kSuppressedValues) {
         if (strcmp(name, entry.key) == 0 && strcmp(value, entry.value) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// The subset of suppressed values that unambiguously name a virtualized host
-// regardless of which key produced them. Used by the prop_info-keyless read()
-// path, where the key is not available to compare against.
-bool isEmulatorValue(const char *value) {
-    static const char *const kEmulatorValues[] = {
-        "goldfish",
-        "ranchu",
-        "cutf_cvm",
-        "sdk",
-        "google_sdk",
-        "emulator",
-        "Android SDK built for x86",
-        "Android SDK built for x86_64",
-        "Android SDK built for arm",
-        "Android SDK built for arm64",
-    };
-    for (const char *emulator : kEmulatorValues) {
-        if (strcmp(value, emulator) == 0) {
             return true;
         }
     }
@@ -208,54 +199,74 @@ void rememberSuppressedInfo(const prop_info *pi) {
 
 }  // namespace
 
-// --- __system_property_find --------------------------------------------------
+// --- reentrancy guard --------------------------------------------------------
 //
-// The read callback is the only way to reach most properties on API 26+:
-// SystemProperties.get() resolves the prop_info once and then reads it
-// repeatedly. Intercepting find() means the lookup reports "no such property",
-// which short-circuits every reader built on top of it. Callers that already
-// hold a cached prop_info from before installation still reach read(), which is
-// why read() is patched as well.
+// liblog resolves its own configuration through __system_property_get on first
+// use, so anything that logs from inside a property hook re-enters the hook on
+// the same thread. An unguarded __android_log_print on this path recurses until
+// the stack is exhausted. The nested call returns the real value and is
+// harmless; one-time facts are logged by install_property_hooks() instead.
+//
+// thread_local rather than a plain bool: property reads happen on every thread
+// in the process, and a shared flag would let one thread's suppressed read leak
+// into another's real read.
+thread_local bool t_inPropertyHook = false;
 
 // --- __system_property_read --------------------------------------------------
+//
+// read() is deprecated in favour of read_callback() but is still what a fair
+// amount of existing code calls. Its second parameter is a `name` out-parameter,
+// which is what makes key-accurate suppression possible here.
 
-int hidden_system_property_read(const prop_info *pi, char *value, int *value_len) {
+// Matches libc: int __system_property_read(const prop_info* pi, char* name, char* value).
+int hidden_system_property_read(const prop_info *pi, char *name, char *value) {
     if (pi == nullptr || orig_system_property_read == nullptr) {
         return -1;
     }
     if (isSuppressedInfo(pi)) {
+        if (name != nullptr) {
+            name[0] = '\0';
+        }
         if (value != nullptr) {
             value[0] = '\0';
         }
-        return PROP_VALUE_MAX;
+        return 0;
     }
-    int result = orig_system_property_read(pi, value, value_len);
+    int result = orig_system_property_read(pi, name, value);
     if (result < 0) {
         return result;
     }
-    // A prop_info that was resolved before these hooks were installed still
-    // yields its real value here. Catch the virtualized-host markers by value
-    // so those reads come back absent too. The key is not available on this
-    // path, so the check is deliberately narrow: only values that name a
-    // virtualized host on their own, never the real device fingerprint.
-    if (value != nullptr && isEmulatorValue(value)) {
-        return reportAbsent(value);
+    // libc has now written the key into `name`, so decide by key. This also
+    // covers a prop_info that was cached by a caller before these hooks were
+    // installed, which find() never saw.
+    if (name != nullptr && (shouldSuppressKey(name) || shouldSuppressValue(name, value))) {
+        if (value != nullptr) {
+            value[0] = '\0';
+        }
+        return 0;
     }
     return result;
 }
 
-void hidden_system_property_find(const char *name, const prop_info **pi) {
-    if (orig_system_property_find != nullptr) {
-        orig_system_property_find(name, pi);
-    } else {
-        *pi = nullptr;
-    }
+// Matches libc: const prop_info* __system_property_find(const char* name).
+//
+// The prop_info* comes back in the return register. Suppressing a key here means
+// the caller sees "no such property", which is exactly what an app asking
+// whether the property is set is checking, and it short-circuits every reader
+// built on top of find() rather than filtering after the fact.
+const prop_info *hidden_system_property_find(const char *name) {
+    const prop_info *pi = orig_system_property_find != nullptr
+                                  ? orig_system_property_find(name)
+                                  : nullptr;
     if (shouldSuppressKey(name)) {
-        // Record the pointer before dropping it, so a caller that grabbed a
-        // prop_info through another route still gets an absent read.
-        rememberSuppressedInfo(*pi);
-        *pi = nullptr;
+        // Remember the pointer before dropping it. A caller that resolved this
+        // property through another route still holds it, and read() would
+        // otherwise hand back the real value for a key we already decided to
+        // hide.
+        rememberSuppressedInfo(pi);
+        return nullptr;
     }
+    return pi;
 }
 
 // --- __system_property_read_callback -----------------------------------------
@@ -314,22 +325,26 @@ void installIfPresent(const char *name, void *symbol, void *replacement, void **
 }  // namespace
 
 int hidden_system_property_get(const char *name, char *value) {
-    if (shouldSuppressKey(name)) {
-        LOGD("suppressed %s", name);
-        return reportAbsent(value);
+    if (t_inPropertyHook) {
+        return orig_system_property_get != nullptr ? orig_system_property_get(name, value) : 0;
     }
-    if (orig_system_property_get == nullptr) {
+    t_inPropertyHook = true;
+    int result;
+    if (shouldSuppressKey(name)) {
+        result = reportAbsent(value);
+    } else if (orig_system_property_get == nullptr) {
         if (value != nullptr) {
             value[0] = '\0';
         }
-        return 0;
+        result = 0;
+    } else {
+        result = orig_system_property_get(name, value);
+        if (result > 0 && shouldSuppressValue(name, value)) {
+            result = reportAbsent(value);
+        }
     }
-    int length = orig_system_property_get(name, value);
-    if (length > 0 && shouldSuppressValue(name, value)) {
-        LOGD("suppressed value for %s", name);
-        return reportAbsent(value);
-    }
-    return length;
+    t_inPropertyHook = false;
+    return result;
 }
 
 void install_property_hooks() {
