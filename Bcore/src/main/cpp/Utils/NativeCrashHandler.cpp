@@ -187,6 +187,8 @@ void appendRawFrameRecord(char *out, size_t capacity, const char *tag, uintptr_t
 void appendModuleRecord(char *out, size_t capacity, const char *tag, uintptr_t pc);
 void commitRecord(const char *record);
 void dumpProcMaps();
+int walkInterruptedStack(uintptr_t *out, int maxFrames, uintptr_t framePointer,
+                         uintptr_t linkRegister, uintptr_t anchorSp);
 static void noteForeignHandler(int index, const struct sigaction *act);
 static void installOurHandler(int signum);
 
